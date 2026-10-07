@@ -1,0 +1,9 @@
+sslcheck
+Copyright 2026 Konstantinos Lykourentzos
+
+This product includes software developed as an original, clean-room
+implementation of the TLS checks performed by testssl.sh. It does not contain
+or derive from testssl.sh source code.
+
+This product depends on zcrypto (github.com/zmap/zcrypto), licensed under the
+Apache License, Version 2.0.
