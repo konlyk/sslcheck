@@ -219,9 +219,9 @@ func opensslVerifyError(chain []*x509.Certificate, err error, leafSelfSigned boo
 		return "self signed CA in chain", false
 	case bytes.Equal(top.RawIssuer, top.RawSubject):
 		return "self signed", false
-	case len(chain) == 1:
-		return "chain incomplete, only 1 cert provided", true
 	default:
+		// OpenSSL reports "unable to get local issuer certificate" (code 20) whether the server
+		// sent some intermediates or only the leaf, so both word the same as testssl's.
 		return "chain incomplete", true
 	}
 }
