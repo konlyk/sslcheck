@@ -90,9 +90,13 @@ func (c Certificate) Expired() bool { return !c.Expires.IsZero() && c.Expires.Be
 
 // Options tune a scan; the zero value is the normal scan.
 type Options struct {
-	Timeout    time.Duration  // per connection; 0 = 10s
-	ServerName string         // SNI; defaults to the host
-	Roots      *x509.CertPool // trust anchors; nil = the system's
+	Timeout    time.Duration // per connection; 0 = 10s
+	ServerName string        // SNI; defaults to the host
+	// Roots is the set of trust anchors for the certificate verdict; nil uses the system's. With
+	// nil, Go's verifier may also fetch a missing intermediate from the certificate's AIA URL on
+	// macOS and Windows but not on Linux, so an incomplete chain can grade differently by platform.
+	// Pass an explicit pool for a deterministic verdict.
+	Roots *x509.CertPool
 	// CheckRevocation also asks the certificate's OCSP responder, as testssl's --phone-out does.
 	// A stapled OCSP response is always read.
 	CheckRevocation bool
