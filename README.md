@@ -154,7 +154,15 @@ go run ./cmd/sslcheck example.com:443
   configuration and a few flaws from how the host answers crafted records.
 - Grades follow testssl's `run_rating` rather than the guide's prose where the two differ, so a
   result can be checked against a current testssl; they can still differ slightly from another
-  testssl version's own opinion.
+  testssl version's own opinion. In particular, matching testssl means: the guide's "no AEAD
+  cipher" cap is not applied (testssl's own pattern for it never matches); the key-exchange score
+  does not fold in the ephemeral DH group size (testssl scores it as a `DHE` key, which its scorer
+  ignores), so a host with a small DH group is not capped on that account even though the guide
+  would fail it; and the SWEET32 cap is applied only when a 64-bit-block cipher is reachable at
+  TLS 1.1 but not at the host's preferred protocol.
+- The certificate verdict uses `Options.Roots`; with `nil` it follows the host platform, which can
+  fetch a missing intermediate on macOS and Windows but not on Linux. Pass an explicit pool (the
+  CLI's `-ca-bundle`) when you need the same answer everywhere.
 
 ## License
 
