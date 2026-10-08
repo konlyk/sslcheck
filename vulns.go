@@ -96,7 +96,7 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 		add(Vuln{"TICKETBLEED", "HIGH", "CVE-2016-9244", "CWE-200", "the server returns memory in a session-ticket echo"})
 	}
 	if ctx.Err() == nil {
-		if r := robot(ctx, host, addr, opts); r != "" {
+		if r := robot(ctx, addr, opts); r != "" {
 			add(Vuln{"ROBOT", "HIGH", "CVE-2017-17382 CVE-2017-17427 CVE-2017-13099", "CWE-203", r})
 		}
 	}

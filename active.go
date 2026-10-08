@@ -6,9 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	cryptotls "crypto/tls"
+	"crypto/x509"
 	"math/big"
-
-	ztls "github.com/zmap/zcrypto/tls"
 )
 
 // The active probes send crafted handshake records and read a flaw from how the server answers,
@@ -187,114 +186,177 @@ func serverHelloSessionID(sh []byte) []byte {
 }
 
 // robot reports a Bleichenbacher RSA padding oracle (ROBOT) when the server's answers to a small
-// fixed set of malformed RSA key-exchange messages let an attacker tell a well-padded premaster
+// fixed set of (mis)formed RSA key-exchange messages let an attacker tell a well-padded premaster
 // from a badly-padded one. It only ever sends that fixed set — it does not run the attack — and
 // returns "" when the server offers no RSA key exchange or does not behave as an oracle.
-func robot(ctx context.Context, host, addr string, opts Options) string {
-	pub, ok := rsaKeyIfRSAKex(ctx, addr, opts)
-	if !ok {
+func robot(ctx context.Context, addr string, opts Options) string {
+	pub := rsaKexPubKey(ctx, addr, opts)
+	if pub == nil {
 		return "" // no RSA key exchange to probe
 	}
-	// Each probe is a differently (mis)formed PKCS#1 v1.5 block of the server key's size. A server
-	// that is not an oracle answers them all alike; one that distinguishes "valid" from "invalid"
-	// padding is vulnerable.
 	size := pub.Size()
-	probes := robotProbes(size)
-	var responses []string
-	for _, pms := range probes {
-		if ctx.Err() != nil {
-			return ""
-		}
-		responses = append(responses, robotResponse(ctx, addr, opts, pub, pms))
+	if size < 59 { // too small to hold PKCS#1 v1.5 framing, padding and a 48-byte premaster
+		return ""
 	}
-	// The first probe is the well-formed one; if any malformed probe answers differently from it
-	// in a consistent way, the padding is observable.
-	oracle := false
-	for _, resp := range responses[1:] {
-		if resp != responses[0] {
-			oracle = true
-		}
+	// The premaster carries the offered ClientHello version; a server that checks it treats a
+	// premaster with the wrong version as invalid, so the valid probe must match it or the oracle
+	// is masked.
+	const version = uint16(0x0303)
+	// Run the five-probe battery twice. Report vulnerable only when it distinguishes the probes
+	// and distinguishes them the same way both times, so a transient answer (a dropped connection,
+	// a one-off timeout) is never mistaken for a padding oracle.
+	first, ok := robotBattery(ctx, addr, opts, pub, size, version)
+	if !ok || allEqual(first) {
+		return ""
 	}
-	if !oracle {
+	second, ok := robotBattery(ctx, addr, opts, pub, size, version)
+	if !ok || !sameDiffPattern(first, second) {
 		return ""
 	}
 	return "the server's answers to malformed RSA key exchanges differ by padding validity"
 }
 
-// rsaKeyIfRSAKex returns the server's RSA public key when it negotiates an RSA key-exchange
-// cipher, which is what a ROBOT oracle needs; otherwise ok is false.
-func rsaKeyIfRSAKex(ctx context.Context, addr string, opts Options) (*rsa.PublicKey, bool) {
-	// zcrypto handshake offering only RSA-kx suites; if it succeeds, the cert key is the oracle key.
-	log, err := legacyHandshake(ctx, addr, ztls.VersionTLS12, rsaKexSuites, opts)
-	if err != nil || log == nil || log.ServerHello == nil {
-		return nil, false
+// robotBattery sends the five probes once and returns how the server answered each. ok is false
+// when a probe could not be delivered (a dial or write failure), which makes the whole run
+// inconclusive rather than a signal.
+func robotBattery(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, size int, version uint16) ([]string, bool) {
+	probes := robotProbes(size, version)
+	resp := make([]string, 0, len(probes))
+	for _, p := range probes {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		r, ok := robotResponse(ctx, addr, opts, pub, p, version)
+		if !ok {
+			return nil, false
+		}
+		resp = append(resp, r)
 	}
-	// Re-fetch the leaf through crypto/tls for a clean *rsa.PublicKey.
-	d := &cryptotls.Dialer{Config: &cryptotls.Config{InsecureSkipVerify: true, ServerName: opts.ServerName, MaxVersion: cryptotls.VersionTLS12}}
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, false
-	}
-	defer conn.Close()
-	certs := conn.(*cryptotls.Conn).ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		return nil, false
-	}
-	pub, ok := certs[0].PublicKey.(*rsa.PublicKey)
-	return pub, ok
+	return resp, true
 }
 
-// robotProbes are a well-formed PKCS#1 v1.5 block followed by malformed variants, each the key's
-// byte length. They are fixed decoys; nothing real is encrypted.
-func robotProbes(size int) [][]byte {
-	pms := make([]byte, 48)
-	_, _ = rand.Read(pms)
-	valid := make([]byte, size)
-	valid[0], valid[1] = 0x00, 0x02 // correct PKCS#1 v1.5 framing
-	for i := 2; i < size-49; i++ {
-		valid[i] = 0x01 // non-zero padding
-	}
-	valid[size-49] = 0x00
-	copy(valid[size-48:], pms)
-
-	wrongFirst := append([]byte(nil), valid...)
-	wrongFirst[0] = 0x01 // not 0x00
-	wrongSecond := append([]byte(nil), valid...)
-	wrongSecond[1] = 0x01 // not 0x02
-	noZero := append([]byte(nil), valid...)
-	noZero[size-49] = 0x01 // no 0x00 delimiter before the premaster
-	return [][]byte{valid, wrongFirst, wrongSecond, noZero}
-}
-
-// robotResponse sends one crafted RSA ClientKeyExchange and reports how the server answered,
-// classified coarsely (an alert code, "none", or "closed").
-func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, block []byte) string {
+// rsaKexPubKey offers only RSA key-exchange suites and returns the RSA public key from the
+// certificate the server sends in that same handshake. Reading the key from the probe's own
+// Certificate message (rather than a second, unrestricted connection) uses exactly the key an RSA
+// key exchange encrypts to, so a host that also serves an ECDSA certificate is probed correctly.
+func rsaKexPubKey(ctx context.Context, addr string, opts Options) *rsa.PublicKey {
 	r, err := dialRaw(ctx, addr, opts)
 	if err != nil {
-		return "dial-error"
+		return nil
 	}
 	defer r.close()
 	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, rsaKexSuites, nil, nil)); err != nil {
-		return "write-error"
+		return nil
+	}
+	msgs, err := r.readUntilServerHelloDone()
+	if err != nil {
+		return nil
+	}
+	return leafRSAKey(msgs[hsCertificate])
+}
+
+// leafRSAKey parses the leaf out of a TLS Certificate handshake message and returns its RSA public
+// key, or nil when the leaf is absent or not an RSA key.
+func leafRSAKey(cert []byte) *rsa.PublicKey {
+	if len(cert) < 6 { // 3-byte list length + 3-byte first-certificate length
+		return nil
+	}
+	list := cert[3:]
+	n := int(list[0])<<16 | int(list[1])<<8 | int(list[2])
+	if len(list) < 3+n {
+		return nil
+	}
+	c, err := x509.ParseCertificate(list[3 : 3+n])
+	if err != nil {
+		return nil
+	}
+	pub, _ := c.PublicKey.(*rsa.PublicKey)
+	return pub
+}
+
+// robotProbes is one correctly padded PKCS#1 v1.5 block carrying the offered version, followed by
+// four malformed variants, each exactly the key's byte length. They are fixed decoys; nothing
+// real is encrypted. A server that is not an oracle answers all five alike.
+func robotProbes(size int, version uint16) [][]byte {
+	pms := make([]byte, 48)
+	_, _ = rand.Read(pms)
+	pms[0], pms[1] = byte(version>>8), byte(version) // the client version a checking server expects
+	block := func() []byte {
+		b := make([]byte, size)
+		for i := 2; i < size-49; i++ {
+			b[i] = 0x01 // non-zero PKCS#1 padding
+		}
+		b[0], b[1] = 0x00, 0x02 // correct PKCS#1 v1.5 framing
+		b[size-49] = 0x00       // the 0x00 delimiter before the premaster
+		copy(b[size-48:], pms)
+		return b
+	}
+	valid := block()
+	wrongFirst := block()
+	wrongFirst[0] = 0x01 // first byte not 0x00
+	wrongSecond := block()
+	wrongSecond[1] = 0x01 // second byte not 0x02
+	noDelimiter := block()
+	noDelimiter[size-49] = 0x01 // no 0x00 before the premaster
+	earlyZero := block()
+	earlyZero[2] = 0x00 // a 0x00 inside the padding
+	return [][]byte{valid, wrongFirst, wrongSecond, noDelimiter, earlyZero}
+}
+
+// robotResponse sends one crafted RSA ClientKeyExchange and reports how the server answered,
+// classified coarsely (an alert code, "data" for a plaintext record, or "closed"). ok is false
+// only when the probe could not be delivered at all, which the caller treats as inconclusive.
+func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, block []byte, version uint16) (string, bool) {
+	r, err := dialRaw(ctx, addr, opts)
+	if err != nil {
+		return "", false
+	}
+	defer r.close()
+	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, rsaKexSuites, nil, nil)); err != nil {
+		return "", false
 	}
 	if _, err := r.readUntilServerHelloDone(); err != nil {
-		return "no-serverhellodone"
+		return "", false
 	}
 	enc := rsaEncryptBlock(pub, block)
 	cke := handshakeMessage(16, append(uint16b(len(enc)), enc...)) // 16 = client_key_exchange
-	if err := r.writeRecord(recHandshake, 0x0303, cke); err != nil {
-		return "cke-write-error"
+	if err := r.writeRecord(recHandshake, version, cke); err != nil {
+		return "", false
 	}
-	_ = r.writeRecord(recChangeCipher, 0x0303, []byte{0x01})
-	_ = r.writeRecord(recHandshake, 0x0303, bytes.Repeat([]byte{0x00}, 40)) // a dummy encrypted Finished
+	_ = r.writeRecord(recChangeCipher, version, []byte{0x01})
+	_ = r.writeRecord(recHandshake, version, bytes.Repeat([]byte{0x00}, 40)) // a dummy encrypted Finished
 	_, _, err = r.readRecord()
 	if a, ok := asAlert(err); ok {
-		return "alert-" + itoaByte(a.code)
+		return "alert-" + itoaByte(a.code), true
 	}
 	if err != nil {
-		return "closed"
+		return "closed", true
 	}
-	return "none"
+	return "data", true
+}
+
+// allEqual reports whether every element equals the first.
+func allEqual(xs []string) bool {
+	for _, x := range xs[1:] {
+		if x != xs[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameDiffPattern reports whether a and b set the same probes apart from the first one, so that a
+// difference counts as an oracle only when it reproduces.
+func sameDiffPattern(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if (a[i] == a[0]) != (b[i] == b[0]) {
+			return false
+		}
+	}
+	return true
 }
 
 // rsaEncryptBlock raw-RSA-encrypts an already-padded block (m^e mod n), without adding padding of
