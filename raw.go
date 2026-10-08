@@ -66,11 +66,7 @@ func (r *rawConn) readRecord() (byte, []byte, error) {
 	if _, err := io.ReadFull(r.conn, head); err != nil {
 		return 0, nil, err
 	}
-	length := int(binary.BigEndian.Uint16(head[3:5]))
-	if length > 1<<16 {
-		return 0, nil, errors.New("record too large")
-	}
-	body := make([]byte, length)
+	body := make([]byte, binary.BigEndian.Uint16(head[3:5]))
 	if _, err := io.ReadFull(r.conn, body); err != nil {
 		return 0, nil, err
 	}

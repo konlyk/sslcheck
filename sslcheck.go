@@ -129,7 +129,7 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	if !opts.SkipHTTP {
 		a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts)
 	}
-	a.Vulns = scanVulns(ctx, host, addr, a, opts)
+	a.Vulns = scanVulns(ctx, addr, a, opts)
 	rate(a)
 	return a, nil
 }

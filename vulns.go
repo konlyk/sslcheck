@@ -20,7 +20,7 @@ type Vuln struct {
 
 // scanVulns collects the host's weaknesses: those that follow from the protocols and ciphers it
 // offers, and those found by an active probe.
-func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Options) []Vuln {
+func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []Vuln {
 	var out []Vuln
 	add := func(v Vuln) { out = append(out, v) }
 
