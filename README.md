@@ -70,9 +70,11 @@ certificate hostname check.
 
 ```go
 type Options struct {
-	Timeout    time.Duration  // per connection; 0 = 10s
-	ServerName string         // SNI; defaults to host
-	Roots      *x509.CertPool // trust anchors for the certificate verdict; nil = the system roots
+	Timeout         time.Duration  // per connection; 0 = 10s
+	ServerName      string         // SNI; defaults to host
+	Roots           *x509.CertPool // trust anchors for the certificate verdict; nil = the system roots
+	CheckRevocation bool           // also ask the certificate's OCSP responder (a stapled response is always read)
+	SkipHTTP        bool           // skip the HTTP request that reads HSTS and HPKP, for non-HTTP services
 }
 ```
 
@@ -82,12 +84,20 @@ type Options struct {
 type Assessment struct {
 	Protocols     []Protocol    // every version tested, offered or not
 	Ciphers       []Cipher      // the accepted ciphers, best protocol first
-	Certificates  []Certificate // the served chain, leaf first
+	Certificates  []Certificate // one per certificate type the host serves (RSA, ECDSA …)
 	ForwardSecret bool          // every accepted key exchange is ephemeral
-	Vulns         []Vuln        // the weaknesses found
-	Grade         string        // A+ … F, or M (name mismatch) / T (untrusted)
-	Score         int           // 0–100, capped by the grade
-	Reasons       []string      // why the grade is capped
+
+	Compression         bool         // the server agreed to TLS compression (CRIME)
+	SecureRenegotiation *bool        // RFC 5746 secure renegotiation; nil when only TLS 1.3 is offered
+	HTTP                *HTTPHeaders // what the HTTP answer says about TLS (HSTS, HPKP); nil when not fetched
+
+	Grade               string   // A+ … F, or M (name mismatch) / T (untrusted)
+	Score               int      // 0–100; 0 when the grade is F, T or M
+	ProtocolScore       int      // category 1, protocol support
+	KeyExchangeScore    int      // category 2, key exchange
+	CipherStrengthScore int      // category 3, cipher strength
+	Reasons             []string // the grade caps that were applied
+	Warnings            []string // what keeps an A from an A+ (it is then A-)
 }
 ```
 
@@ -95,8 +105,10 @@ type Assessment struct {
 `Offered` and `Deprecated`. `Cipher` carries the IANA `Name`, the `Version` it was accepted at, a
 `Strength` (`StrengthStrong` / `StrengthWeak` / `StrengthInsecure`), `Bits` and `Forward`.
 `Certificate` carries `CommonName`, `AltNames`, `Issuer`, `Trusted`, `NameMismatch`, `TrustReason`,
-`ChainComplete`, `FingerprintSHA256`, `KeyType`, `SignatureAlg`, `Expires` and an `Expired()`
-method, plus the parsed `Leaf` (`*crypto/x509.Certificate`). `Vuln` carries `Name`, `Severity`
+`ChainComplete`, `ChainIncomplete`, `ChainError`, `SelfSigned`, `FingerprintSHA256`, `KeyType`,
+`KeyAlg`, `KeyBits`, `RSAExponent`, `SignatureAlg`, `SignatureHash`, `Expires` and an `Expired()`
+method, `OCSPStapled`, `Revoked`, `RevocationSource`, and the parsed `Leaf`/`Chain`
+(`*crypto/x509.Certificate`, excluded from the JSON). `Vuln` carries `Name`, `Severity`
 (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`), `CVE`, `CWE` and a `Remark`.
 
 ## What it checks
@@ -104,11 +116,17 @@ method, plus the parsed `Leaf` (`*crypto/x509.Certificate`). `Vuln` carries `Nam
 - **Protocols**: SSLv2 (by a raw hello), SSLv3, TLS 1.0, 1.1, 1.2 and 1.3.
 - **Ciphers**: every suite the host accepts at each version, each classified strong / weak /
   insecure, with its key size and whether its key exchange is forward-secret.
-- **Certificate**: common name, SANs, issuer, key type, signature algorithm, SHA-256 fingerprint,
-  expiry, chain completeness, and whether it is trusted and valid for the hostname (verified with
-  `crypto/x509` against the system roots, so the verdict tracks what browsers trust).
-- **Grade**: the SSL Labs letter and score, with the usual caps (old protocols, weak ciphers,
-  certificate problems, high-severity findings).
+- **Certificate**: one per certificate type the host serves (an RSA and an ECDSA certificate are
+  described separately), each with its common name, SANs, issuer, key algorithm and size, signature
+  algorithm and hash, SHA-256 fingerprint, expiry, chain completeness, OCSP stapling and revocation,
+  and whether it is trusted and valid for the hostname. A failed chain is classified the way testssl
+  reads OpenSSL's verify result, so a missing intermediate is reported as an incomplete chain rather
+  than depending on the platform verifier fetching it.
+- **Session features**: TLS compression (CRIME) and RFC 5746 secure renegotiation.
+- **HTTP**: the HSTS and HPKP headers of the host's answer to `GET /` (skip with `Options.SkipHTTP`).
+- **Grade**: the SSL Labs letter and score as testssl's `run_rating` computes them — three category
+  scores (protocol support, key exchange, cipher strength) weighted 30/30/40, every `set_grade_cap`
+  and `set_grade_warning` rule, and A+/A- awarded from the warning set.
 - **Vulnerabilities derived from what is offered**: DROWN, FREAK, LOGJAM, SWEET32, RC4, BEAST,
   POODLE (SSL), LUCKY13, and NULL / anonymous ciphers.
 - **Active probes**: Heartbleed, CCS injection, Ticketbleed and ROBOT. Each is conservative — an
@@ -116,7 +134,7 @@ method, plus the parsed `Leaf` (`*crypto/x509.Certificate`). `Vuln` carries `Nam
   scan never raises a false alarm. The probes are detection only; they do not run the attacks.
 
 Deliberately out of scope (testssl features with no bearing on the assessment): text/CSV/HTML
-reports, mass testing, STARTTLS for mail servers, browser simulations and HTTP-header checks.
+reports, mass testing, STARTTLS for mail servers, and browser simulations.
 
 ## CLI
 
@@ -129,13 +147,14 @@ go run ./cmd/sslcheck example.com:443
 
 ## Notes
 
-- A scan opens many short connections (one per cipher per protocol, plus the probes); a full run
-  against one host takes on the order of a minute or two, as testssl does. Bound it with the
-  context and `Options.Timeout`.
+- A scan opens many short connections (one per cipher per protocol, plus the probes); the protocols,
+  their cipher enumerations and the active probes run concurrently, so a run usually takes seconds to
+  a minute depending on how much the host offers. Bound it with the context and `Options.Timeout`.
 - This is not a TLS implementation and never decrypts or recovers anything; it reads a host's
   configuration and a few flaws from how the host answers crafted records.
-- Grades track the SSL Labs guide and so can differ slightly from a given testssl version's own
-  opinion (for example an RC4-only host is graded C here, following the guide).
+- Grades follow testssl's `run_rating` rather than the guide's prose where the two differ, so a
+  result can be checked against a current testssl; they can still differ slightly from another
+  testssl version's own opinion.
 
 ## License
 
