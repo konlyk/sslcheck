@@ -133,8 +133,9 @@ func certHandshake(ctx context.Context, addr string, opts Options, suites []uint
 // verdict is the current one.
 func certFromLegacy(ctx context.Context, addr string, opts Options) []*x509.Certificate {
 	for _, version := range []uint16{ztls.VersionTLS12, ztls.VersionTLS10, ztls.VersionSSL30} {
-		log, err := legacyHandshake(ctx, addr, version, cipherIDs(), opts)
-		if err != nil || log == nil || log.ServerCertificates == nil {
+		// The chain is logged as soon as the Certificate message is read, whatever happens later.
+		log, _ := legacyHandshake(ctx, addr, version, cipherIDs(), opts)
+		if log == nil || log.ServerCertificates == nil {
 			continue
 		}
 		var chain []*x509.Certificate
