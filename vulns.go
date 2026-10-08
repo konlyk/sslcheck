@@ -122,9 +122,22 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 // 3DES-only host, which is just the sort of old OpenSSL that bleeds — still completes the
 // handshake the heartbeat rides on.
 func heartbleed(ctx context.Context, addr string, suites []uint16, opts Options) bool {
+	if len(suites) > 0 {
+		if vulnerable, decided := heartbleedWith(ctx, addr, suites, opts); decided {
+			return vulnerable
+		}
+		// The server picked an accepted suite zcrypto cannot finish: try zcrypto's own defaults.
+	}
+	vulnerable, _ := heartbleedWith(ctx, addr, nil, opts)
+	return vulnerable
+}
+
+// heartbleedWith runs zcrypto's check offering suites (its defaults when nil). decided is false
+// when the handshake did not complete, so the check could not say either way.
+func heartbleedWith(ctx context.Context, addr string, suites []uint16, opts Options) (vulnerable, decided bool) {
 	conn, err := dial(ctx, addr, opts)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(opts.timeout()))
@@ -133,10 +146,15 @@ func heartbleed(ctx context.Context, addr string, suites []uint16, opts Options)
 		cfg.CipherSuites, cfg.ForceSuites = suites, true
 	}
 	c := ztls.Client(conn, cfg)
-	if _, err := c.CheckHeartbleed(make([]byte, 256)); err == ztls.HeartbleedError {
-		return c.GetHeartbleedLog() != nil && c.GetHeartbleedLog().Vulnerable
+	_, err = c.CheckHeartbleed(make([]byte, 256))
+	switch {
+	case err == nil: // the handshake completed and the server offers no heartbeat extension
+		return false, true
+	case err == ztls.HeartbleedError: // the heartbeat went out; the log says what came back
+		return c.GetHeartbleedLog() != nil && c.GetHeartbleedLog().Vulnerable, true
+	default: // the handshake itself failed
+		return false, false
 	}
-	return false
 }
 
 // legacyCipherIDs are the ids of the accepted ciphers below TLS 1.3, which is as high as the
