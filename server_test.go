@@ -44,10 +44,13 @@ func localServer(t *testing.T, cfg *cryptotls.Config) (addr string, roots *x509.
 
 // A modern server (TLS 1.2 + 1.3, a trusted certificate) is detected, enumerated, described and
 // graded end to end.
+// modernConfig is a server config offering TLS 1.2 and 1.3.
+func modernConfig() *cryptotls.Config {
+	return &cryptotls.Config{MinVersion: cryptotls.VersionTLS12, MaxVersion: cryptotls.VersionTLS13}
+}
+
 func TestScanModernServer(t *testing.T) {
-	addr, roots := localServer(t, &cryptotls.Config{
-		MinVersion: cryptotls.VersionTLS12, MaxVersion: cryptotls.VersionTLS13,
-	})
+	addr, roots := localServer(t, modernConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	a, err := Scan(ctx, "localhost", addr, Options{Roots: roots, Timeout: 3 * time.Second, SkipHTTP: true})

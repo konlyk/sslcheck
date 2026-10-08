@@ -1,0 +1,124 @@
+package sslcheck
+
+import (
+	"context"
+	"crypto/rand"
+	"net"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// rsaKexHandshake answers a ClientHello with a ServerHello choosing an RSA-key-exchange suite, the
+// leaf certificate, and ServerHelloDone, which is the flight the CCS and ROBOT probes read before
+// their crafted continuation. It returns false if no ClientHello arrived.
+func rsaKexHandshake(c net.Conn, leaf []byte) bool {
+	h, err := readClientHello(c)
+	if err != nil {
+		return false
+	}
+	suite := pickSuite(h, 0x0035, 0x002f, 0x000a) // RSA_WITH_AES_256_CBC_SHA etc: no ServerKeyExchange
+	srvWrite(c, recHandshake, serverHelloMsg(suite, nil, compressionNone, false))
+	srvWrite(c, recHandshake, certificateMsg(leaf))
+	srvWrite(c, recHandshake, serverHelloDoneMsg())
+	return true
+}
+
+// drainRecords reads and discards up to n records, stopping early on error.
+func drainRecords(c net.Conn, n int) {
+	for i := 0; i < n; i++ {
+		if _, _, err := srvRead(c); err != nil {
+			return
+		}
+	}
+}
+
+// A server that answers the second early ChangeCipherSpec with a bad_record_mac alert is the
+// vulnerable OpenSSL signature; one that answers with unexpected_message is patched.
+func TestCCSInjection(t *testing.T) {
+	cert, _, _ := testCert(t)
+	cases := []struct {
+		name  string
+		alert byte
+		want  bool
+	}{
+		{"vulnerable bad_record_mac", 20, true},
+		{"vulnerable decryption_failed", 21, true},
+		{"patched unexpected_message", 10, false},
+		{"patched handshake_failure", 40, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := scriptedServer(t, func(_ int, c net.Conn) {
+				if !rsaKexHandshake(c, cert.Certificate[0]) {
+					return
+				}
+				drainRecords(c, 2) // the two early ChangeCipherSpec records
+				srvAlert(c, tc.alert)
+			})
+			require.Equal(t, tc.want, ccsInjection(context.Background(), addr, testOpts()))
+		})
+	}
+}
+
+// A server whose alert to the well-formed padding differs, reproducibly, from its alert to the
+// malformed probes is a padding oracle; one that answers every probe alike is not.
+func TestRobot(t *testing.T) {
+	cert, _, _ := testCert(t)
+	// robot() opens 1 key-fetch connection, then two batteries of 5 probes each (connections
+	// 2-6 and 7-11). Probe 0 of each battery is the well-formed one.
+	robotServer := func(oracle bool) string {
+		return scriptedServer(t, func(i int, c net.Conn) {
+			if !rsaKexHandshake(c, cert.Certificate[0]) {
+				return
+			}
+			if i == 1 {
+				return // the key-fetch connection reads only up to ServerHelloDone
+			}
+			drainRecords(c, 3) // ClientKeyExchange, ChangeCipherSpec, the dummy Finished
+			pos := (i - 2) % 5
+			if oracle && pos == 0 {
+				srvAlert(c, 20) // the well-formed probe is treated differently
+			} else {
+				srvAlert(c, 40)
+			}
+		})
+	}
+	require.NotEmpty(t, robot(context.Background(), robotServer(true), testOpts()), "an oracle")
+	require.Empty(t, robot(context.Background(), robotServer(false), testOpts()), "uniform answers")
+}
+
+// A server with no RSA key exchange cannot be a ROBOT oracle.
+func TestRobotNoRSAKex(t *testing.T) {
+	addr := scriptedServer(t, func(_ int, c net.Conn) {
+		if _, err := readClientHello(c); err != nil {
+			return
+		}
+		srvAlert(c, 40) // handshake_failure: no suite in common
+	})
+	require.Empty(t, robot(context.Background(), addr, testOpts()))
+}
+
+// ticketbleedEcho returns the full session id the server echoes, from which the caller reads any
+// padding past the id it sent.
+func TestTicketbleedEcho(t *testing.T) {
+	sid := []byte{0x00, 0x0b, 0xad, 0xc0, 0xde, 0x00}
+	echoed := make([]byte, 32)
+	copy(echoed, sid)
+	_, _ = rand.Read(echoed[len(sid):]) // the "memory" past our id
+	addr := scriptedServer(t, func(_ int, c net.Conn) {
+		if _, err := readClientHello(c); err != nil {
+			return
+		}
+		srvWrite(c, recHandshake, serverHelloMsg(0x002f, echoed, compressionNone, false))
+	})
+	got := ticketbleedEcho(context.Background(), addr, testOpts(), sid, extension(0x0023, make([]byte, 16)))
+	require.Equal(t, echoed, got)
+}
+
+// A sound server (the in-process TLS server, which issues tickets but does not leak) is not
+// Ticketbleed-vulnerable.
+func TestTicketbleedNotVulnerable(t *testing.T) {
+	addr, _ := localServer(t, modernConfig())
+	require.False(t, ticketbleed(context.Background(), addr, testOpts()))
+}
