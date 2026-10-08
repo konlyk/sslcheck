@@ -166,9 +166,10 @@ const enumerationRetries = 3
 
 // ciphersAt enumerates the ciphers one protocol accepts, the way testssl does: offer every suite,
 // note the one the server picks, drop it, and offer the rest, until the server accepts none. The
-// server says so with an alert (or, on some servers, by closing); a timeout or a reset is the
-// network failing under the probe, so the same offer is retried a few times, with backoff, and
-// complete is false if it never got an answer.
+// server says so with an alert, or, on some servers, by closing. Anything else (a timeout, a
+// reset, and a close too, since a host shedding load may close as well) is retried a few times
+// with backoff. After that, a persistent close is taken as the server's refusal, while a
+// persistent timeout or reset leaves the list incomplete.
 func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) (ciphers []Cipher, complete bool) {
 	if p.Version == versionTLS13 { // TLS 1.3: its suites are fixed and all strong
 		return tls13Ciphers(ctx, addr, opts), true
@@ -185,14 +186,17 @@ func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) (ciph
 		// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto cannot
 		// finish, a certificate it cannot parse) still names a suite the server accepts.
 		if log == nil || log.ServerHello == nil || uint16(log.ServerHello.Version) != p.Version {
-			if err != nil && isTransportFailure(err) {
-				if retries < enumerationRetries && sleepCtx(ctx, time.Duration(retries+1)*retryBackoff) {
-					retries++
-					continue
-				}
+			if err == nil || isTLSAlert(err) {
+				break // the server's refusal: nothing more is accepted
+			}
+			if retries < enumerationRetries && sleepCtx(ctx, time.Duration(retries+1)*retryBackoff) {
+				retries++
+				continue
+			}
+			if isTransportFailure(err) {
 				return out, false
 			}
-			break // the server's refusal: nothing more is accepted
+			break // closed every time: the server's way of refusing
 		}
 		retries = 0
 		chosen := uint16(log.ServerHello.CipherSuite)

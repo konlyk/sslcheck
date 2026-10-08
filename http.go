@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // HTTPHeaders is what the server's answer to GET / says about its TLS: HSTS and HPKP, the two
@@ -23,7 +24,14 @@ type HTTPHeaders struct {
 func fetchHTTPHeaders(ctx context.Context, host, addr string, opts Options) *HTTPHeaders {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dial(ctx, addr, opts) // to the chosen address, under the connection cap
+			// To the chosen address, under the connection cap. The deadline starts once the
+			// connection exists, so time spent waiting for a slot does not eat the request's time.
+			c, err := dial(ctx, addr, opts)
+			if err != nil {
+				return nil, err
+			}
+			_ = c.SetDeadline(time.Now().Add(opts.timeout()))
+			return c, nil
 		},
 		// TLS 1.0 as the floor: a host that offers nothing newer still has HSTS to read.
 		TLSClientConfig:   &cryptotls.Config{ServerName: opts.ServerName, InsecureSkipVerify: true, MinVersion: cryptotls.VersionTLS10}, //nolint:gosec // reading headers, not trusting
@@ -31,8 +39,7 @@ func fetchHTTPHeaders(ctx context.Context, host, addr string, opts Options) *HTT
 	}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{
-		Transport:     tr,
-		Timeout:       opts.timeout(),
+		Transport:     tr, // the per-connection deadline above bounds the request; no whole-request timeout
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/", nil)
