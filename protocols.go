@@ -41,7 +41,7 @@ var allVersions = []struct {
 // server's answer, so "not offered" there is not certain.
 func scanProtocols(ctx context.Context, addr string, opts Options) ([]Protocol, []string) {
 	out := make([]Protocol, len(allVersions))
-	undecided := make([]bool, len(allVersions))
+	failures := make([]*probeFailure, len(allVersions))
 	var wg sync.WaitGroup
 	for i, v := range allVersions {
 		out[i] = Protocol{Version: v.version, Name: v.name, Deprecated: v.deprecated}
@@ -51,42 +51,101 @@ func scanProtocols(ctx context.Context, addr string, opts Options) ([]Protocol, 
 		wg.Add(1)
 		go func(i int, version uint16) {
 			defer wg.Done()
-			out[i].Offered, undecided[i] = offersVersion(ctx, addr, version, opts)
+			out[i].Offered, failures[i] = offersVersion(ctx, addr, version, opts)
 		}(i, v.version)
 	}
 	wg.Wait()
+	// Some listeners refuse a version they do not speak by dropping or resetting the connection
+	// rather than by an alert, and do so every time. So a probe whose attempts all failed the same
+	// way, on a host that answered some other version, is taken as that refusal: not offered. A mix
+	// of failures (a timeout here, a reset there) is the network, and so is a host that answered
+	// nothing at all; those are what Incomplete is for.
+	answered := anyOffered(out)
 	var incomplete []string
-	for i, u := range undecided {
-		if u {
+	for i, f := range failures {
+		if f != nil && (f.mixed || !answered) {
 			incomplete = append(incomplete, "protocol "+out[i].Name)
 		}
 	}
 	return out, incomplete
 }
 
-// offersVersion reports whether the host completes a handshake at exactly this version. undecided
-// is true when the probe ended on a network failure (a timeout, a reset) rather than an answer.
-func offersVersion(ctx context.Context, addr string, version uint16, opts Options) (offered, undecided bool) {
+// probeFailure is how a probe's attempts failed when none got an answer.
+type probeFailure struct {
+	last  error
+	mixed bool // the attempts failed in different ways
+}
+
+// offersVersion reports whether the host completes a handshake at exactly this version. failure is
+// set when the probe ended on a network failure (a timeout, a reset) after its retries; it is nil
+// when the probe got an answer either way.
+func offersVersion(ctx context.Context, addr string, version uint16, opts Options) (offered bool, failure *probeFailure) {
 	switch version {
 	case versionSSL20:
-		return offersSSL2(ctx, addr, opts), false
+		return offersSSL2(ctx, addr, opts), nil
 	case versionTLS13:
-		conn, err := tls13Dial(ctx, addr, opts)
-		if err != nil {
-			return false, isTransportFailure(err)
+		// Three attempts with backoff on a dropped connection, as for the other versions.
+		var kinds []string
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 && !sleepCtx(ctx, time.Duration(attempt)*retryBackoff) {
+				break
+			}
+			var conn *cryptotls.Conn
+			conn, err = tls13Dial(ctx, addr, opts)
+			if err == nil {
+				_ = conn.Close()
+				return true, nil
+			}
+			if !isTransportFailure(err) {
+				return false, nil // the server answered: an alert, a close, or a lower version
+			}
+			kinds = append(kinds, failureKind(err))
 		}
-		_ = conn.Close()
-		return true, false
+		return false, &probeFailure{last: err, mixed: mixedKinds(kinds)}
 	default:
 		// Offered when the server answers with a ServerHello at that version, whether or not the
 		// rest of the handshake completes. A missed protocol changes the grade, so this probe is
 		// given the full three attempts even when the failures are timeouts.
-		log, err := handshakeAttempts(ctx, addr, version, cipherIDs(), opts, nil, 3)
+		log, err, mixed := handshakeAttempts(ctx, addr, version, cipherIDs(), opts, nil, 3)
 		if log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version {
-			return true, false
+			return true, nil
 		}
-		return false, err != nil && isTransportFailure(err)
+		if err != nil && isTransportFailure(err) {
+			return false, &probeFailure{last: err, mixed: mixed}
+		}
+		return false, nil
 	}
+}
+
+// failureKind names the way a connection failed, so that attempts can be compared.
+func failureKind(err error) string {
+	msg := err.Error()
+	switch {
+	case isTimeout(err):
+		return "timeout"
+	case errors.Is(err, syscall.ECONNRESET) || strings.Contains(msg, "connection reset"):
+		return "reset"
+	case errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(msg, "connection refused"):
+		return "refused"
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return "close"
+	default:
+		return "other"
+	}
+}
+
+// mixedKinds reports whether the failures were not all of one kind.
+func mixedKinds(kinds []string) bool {
+	if len(kinds) == 0 {
+		return false
+	}
+	for _, k := range kinds[1:] {
+		if k != kinds[0] {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyHandshake opens one connection and offers suites at exactly version, returning what the
@@ -101,16 +160,17 @@ func legacyHandshake(ctx context.Context, addr string, version uint16, suites []
 // twice, since a server that twice says nothing for the whole timeout has answered, and a third
 // wait would only make a silently dropping host cost three timeouts per probe.
 func legacyHandshakeWith(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
-	return handshakeAttempts(ctx, addr, version, suites, opts, tweak, 2)
+	log, err, _ := handshakeAttempts(ctx, addr, version, suites, opts, tweak, 2)
+	return log, err
 }
 
 // handshakeAttempts makes up to three handshake attempts, stopping at the first that yields a
 // ServerHello or a TLS alert, and after maxTimeouts of them have timed out. A retry waits a
 // little first: a dropped connection usually means the host is shedding a burst, and an immediate
-// retry lands in the same burst.
-func handshakeAttempts(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config), maxTimeouts int) (*ztls.ServerHandshake, error) {
-	var log *ztls.ServerHandshake
-	var err error
+// retry lands in the same burst. mixed reports whether the failed attempts failed in different
+// ways, which tells a flaky network from a server that always drops a given hello.
+func handshakeAttempts(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config), maxTimeouts int) (log *ztls.ServerHandshake, err error, mixed bool) {
+	var kinds []string
 	timeouts := 0
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 && !sleepCtx(ctx, time.Duration(attempt)*retryBackoff) {
@@ -120,6 +180,7 @@ func handshakeAttempts(ctx context.Context, addr string, version uint16, suites 
 		if (log != nil && log.ServerHello != nil) || err == nil || isTLSAlert(err) || ctx.Err() != nil {
 			break
 		}
+		kinds = append(kinds, failureKind(err))
 		if isTimeout(err) {
 			timeouts++
 			if timeouts >= maxTimeouts {
@@ -127,7 +188,7 @@ func handshakeAttempts(ctx context.Context, addr string, version uint16, suites 
 			}
 		}
 	}
-	return log, err
+	return log, err, mixedKinds(kinds)
 }
 
 // retryBackoff is the wait before the first retry of a dropped connection; later retries wait

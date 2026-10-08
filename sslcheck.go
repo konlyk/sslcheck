@@ -159,13 +159,19 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		a.Compression, a.SecureRenegotiation = scanSessionFeatures(ctx, addr, a.Protocols, opts)
 	}()
 	go func() { defer wg.Done(); a.Vulns = scanVulns(ctx, addr, a, opts) }()
+	var httpErr error
 	if !opts.SkipHTTP {
 		wg.Add(1)
-		go func() { defer wg.Done(); a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts) }()
+		go func() {
+			defer wg.Done()
+			a.HTTP, httpErr = fetchHTTPHeaders(ctx, host, addr, legacyCipherIDs(a.Ciphers), opts)
+		}()
 	}
 	wg.Wait()
-	if !opts.SkipHTTP && a.HTTP == nil {
-		a.Incomplete = append(a.Incomplete, "http") // or the service is not HTTP; the caller knows which
+	// No HTTP answer is a failure only when the network dropped the request; a host crypto/tls
+	// cannot talk to (a legacy-suite-only one), or one that is not HTTP at all, has answered.
+	if httpErr != nil && isTransportFailure(httpErr) {
+		a.Incomplete = append(a.Incomplete, "http")
 	}
 	rate(a)
 	return a, nil

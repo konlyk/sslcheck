@@ -90,10 +90,35 @@ func TestCiphersAtPlainCloseIsAnAnswer(t *testing.T) {
 	require.Len(t, cs, 1)
 }
 
-// A protocol probe that the network keeps dropping is reported undecided, not "not offered".
-func TestOffersVersionUndecidedOnResets(t *testing.T) {
+// A protocol probe that the network keeps dropping reports the failure rather than a plain "not
+// offered"; a host that answers nothing at all then lists the version as incomplete.
+func TestOffersVersionFailureOnResets(t *testing.T) {
 	addr := scriptedServer(t, func(_ int, c net.Conn) { resetConn(c) })
-	offered, undecided := offersVersion(context.Background(), addr, 0x0303, testOpts())
+	offered, failure := offersVersion(context.Background(), addr, 0x0303, testOpts())
 	require.False(t, offered)
-	require.True(t, undecided)
+	require.NotNil(t, failure)
+	require.False(t, failure.mixed, "reset every time")
+
+	_, incomplete := scanProtocols(context.Background(), addr, testOpts())
+	require.Contains(t, incomplete, "protocol TLS1_2")
+}
+
+// A listener that refuses a version with a reset, while answering another, has answered: that
+// version is not offered and not incomplete.
+func TestScanProtocolsResetIsRefusalWhenHostAnswers(t *testing.T) {
+	addr := scriptedServer(t, func(_ int, c net.Conn) {
+		h, err := readClientHello(c)
+		if err != nil {
+			resetConn(c) // SSLv2's raw hello, or a TLS 1.3 hello crypto/tls will not finish
+			return
+		}
+		if pickSuite(h, 0x002f) == 0 {
+			resetConn(c)
+			return
+		}
+		srvWrite(c, recHandshake, serverHelloMsg(0x002f, nil, compressionNone, false))
+	})
+	ps, incomplete := scanProtocols(context.Background(), addr, testOpts())
+	require.True(t, anyOffered(ps), "the TLS 1.0-1.2 hellos were answered")
+	require.Empty(t, incomplete)
 }
