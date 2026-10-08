@@ -3,6 +3,7 @@ package sslcheck
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	ztls "github.com/zmap/zcrypto/tls"
@@ -85,19 +86,29 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 		add(Vuln{"ANON_CIPHER", "HIGH", "", "CWE-327", "an anonymous (unauthenticated) cipher is accepted"})
 	}
 
-	// Active probes.
-	if ctx.Err() == nil && heartbleed(ctx, addr, legacyCipherIDs(a.Ciphers), opts) {
-		add(Vuln{"HEARTBLEED", "CRITICAL", "CVE-2014-0160", "CWE-119", "the server returns memory to a malformed heartbeat"})
-	}
-	if ctx.Err() == nil && ccsInjection(ctx, addr, opts) {
-		add(Vuln{"CCS_INJECTION", "HIGH", "CVE-2014-0224", "CWE-310", "the server accepts an early ChangeCipherSpec"})
-	}
-	if ctx.Err() == nil && ticketbleed(ctx, addr, opts) {
-		add(Vuln{"TICKETBLEED", "HIGH", "CVE-2016-9244", "CWE-200", "the server returns memory in a session-ticket echo"})
-	}
+	// Active probes. Each opens its own connections and is independent of the others, so they run
+	// concurrently; the findings are still added in a fixed order.
 	if ctx.Err() == nil {
-		if r := robot(ctx, addr, opts); r != "" {
-			add(Vuln{"ROBOT", "HIGH", "CVE-2017-17382 CVE-2017-17427 CVE-2017-13099", "CWE-203", r})
+		var hb, ccs, tb bool
+		var rb string
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() { defer wg.Done(); hb = heartbleed(ctx, addr, legacyCipherIDs(a.Ciphers), opts) }()
+		go func() { defer wg.Done(); ccs = ccsInjection(ctx, addr, opts) }()
+		go func() { defer wg.Done(); tb = ticketbleed(ctx, addr, opts) }()
+		go func() { defer wg.Done(); rb = robot(ctx, addr, opts) }()
+		wg.Wait()
+		if hb {
+			add(Vuln{"HEARTBLEED", "CRITICAL", "CVE-2014-0160", "CWE-119", "the server returns memory to a malformed heartbeat"})
+		}
+		if ccs {
+			add(Vuln{"CCS_INJECTION", "HIGH", "CVE-2014-0224", "CWE-310", "the server accepts an early ChangeCipherSpec"})
+		}
+		if tb {
+			add(Vuln{"TICKETBLEED", "HIGH", "CVE-2016-9244", "CWE-200", "the server returns memory in a session-ticket echo"})
+		}
+		if rb != "" {
+			add(Vuln{"ROBOT", "HIGH", "CVE-2017-17382 CVE-2017-17427 CVE-2017-13099", "CWE-203", rb})
 		}
 	}
 	return out

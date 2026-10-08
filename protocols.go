@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	ztls "github.com/zmap/zcrypto/tls"
@@ -31,15 +32,23 @@ var allVersions = []struct {
 	{versionTLS13, "TLS1_3", false},
 }
 
-// scanProtocols tests each version and reports which the host offers.
+// scanProtocols tests each version and reports which the host offers. The versions are
+// independent handshakes, so they run concurrently; the result keeps them oldest-first.
 func scanProtocols(ctx context.Context, addr string, opts Options) []Protocol {
-	out := make([]Protocol, 0, len(allVersions))
-	for _, v := range allVersions {
+	out := make([]Protocol, len(allVersions))
+	var wg sync.WaitGroup
+	for i, v := range allVersions {
+		out[i] = Protocol{Version: v.version, Name: v.name, Deprecated: v.deprecated}
 		if ctx.Err() != nil {
-			break
+			continue
 		}
-		out = append(out, Protocol{Version: v.version, Name: v.name, Deprecated: v.deprecated, Offered: offersVersion(ctx, addr, v.version, opts)})
+		wg.Add(1)
+		go func(i int, version uint16) {
+			defer wg.Done()
+			out[i].Offered = offersVersion(ctx, addr, version, opts)
+		}(i, v.version)
 	}
+	wg.Wait()
 	return out
 }
 

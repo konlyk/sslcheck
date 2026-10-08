@@ -2,7 +2,9 @@ package sslcheck
 
 import (
 	"context"
+	"sort"
 	"strings"
+	"sync"
 
 	ztls "github.com/zmap/zcrypto/tls"
 )
@@ -123,43 +125,60 @@ func tls13Suite(name string) bool {
 func has(s, sub string) bool { return strings.Contains(s, sub) }
 
 // scanCiphers finds the ciphers the host accepts at each offered protocol, best protocol first.
-// It enumerates the way testssl does: offer every suite, note the one the server picks, drop it,
-// and offer the rest, until the server accepts none.
+// The protocols are enumerated concurrently, since each is an independent sequence of handshakes.
 func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Options) []Cipher {
-	var out []Cipher
-	seen := map[string]bool{} // name@version, so a cipher offered at two versions is listed twice but not more
+	var offered []Protocol
 	for _, p := range protocols {
-		if !p.Offered {
-			continue
+		if p.Offered {
+			offered = append(offered, p)
 		}
-		if p.Version == versionTLS13 { // TLS 1.3: its suites are fixed and all strong
-			out = append(out, tls13Ciphers(ctx, addr, opts)...)
-			continue
+	}
+	// Best protocol first, as the Ciphers field is documented.
+	sort.Slice(offered, func(i, j int) bool { return offered[i].Version > offered[j].Version })
+	perProto := make([][]Cipher, len(offered))
+	var wg sync.WaitGroup
+	for i, p := range offered {
+		wg.Add(1)
+		go func(i int, p Protocol) {
+			defer wg.Done()
+			perProto[i] = ciphersAt(ctx, addr, p, opts)
+		}(i, p)
+	}
+	wg.Wait()
+	var out []Cipher
+	for _, cs := range perProto {
+		out = append(out, cs...)
+	}
+	return out
+}
+
+// ciphersAt enumerates the ciphers one protocol accepts, the way testssl does: offer every suite,
+// note the one the server picks, drop it, and offer the rest, until the server accepts none.
+func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) []Cipher {
+	if p.Version == versionTLS13 { // TLS 1.3: its suites are fixed and all strong
+		return tls13Ciphers(ctx, addr, opts)
+	}
+	var out []Cipher
+	seen := map[uint16]bool{}
+	remaining := cipherIDs()
+	for len(remaining) > 0 {
+		if ctx.Err() != nil {
+			return out
 		}
-		remaining := cipherIDs()
-		for len(remaining) > 0 {
-			if ctx.Err() != nil {
-				return out
-			}
-			log, err := legacyHandshake(ctx, addr, p.Version, remaining, opts)
-			// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto
-			// cannot finish, a certificate it cannot parse) still names a suite the server accepts.
-			_ = err
-			if log == nil || log.ServerHello == nil || uint16(log.ServerHello.Version) != p.Version {
-				break
-			}
-			chosen := uint16(log.ServerHello.CipherSuite)
-			info, ok := cipherByID(chosen)
-			if !ok {
-				break
-			}
-			key := info.name + "@" + p.Name
-			if !seen[key] {
-				seen[key] = true
-				out = append(out, Cipher{ID: chosen, Name: info.name, Version: p.Name, Strength: info.strength, Bits: info.bits, Forward: info.forward})
-			}
-			remaining = remove(remaining, chosen)
+		log, _ := legacyHandshake(ctx, addr, p.Version, remaining, opts)
+		// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto cannot
+		// finish, a certificate it cannot parse) still names a suite the server accepts.
+		if log == nil || log.ServerHello == nil || uint16(log.ServerHello.Version) != p.Version {
+			break
 		}
+		chosen := uint16(log.ServerHello.CipherSuite)
+		info, ok := cipherByID(chosen)
+		if !ok || seen[chosen] { // an unknown or already-seen pick means the server stopped cooperating
+			break
+		}
+		seen[chosen] = true
+		out = append(out, Cipher{ID: chosen, Name: info.name, Version: p.Name, Strength: info.strength, Bits: info.bits, Forward: info.forward})
+		remaining = remove(remaining, chosen)
 	}
 	return out
 }
