@@ -94,3 +94,27 @@ func TestGradeFloorAndCeiling(t *testing.T) {
 	require.Equal(t, "A", letter)
 	require.GreaterOrEqual(t, score, 80)
 }
+
+// Forward secrecy caps the grade only when no accepted key exchange has it, as SSL Labs grades: a
+// host that also keeps RSA key exchanges for old clients (GitHub Pages, Cloudflare) is not capped.
+func TestGradeForwardSecrecyCap(t *testing.T) {
+	strong := []Protocol{{Name: "TLS1_2", Offered: true}, {Name: "TLS1_3", Offered: true}}
+	cert := []Certificate{{Trusted: true, KeyType: "RSA 2048"}}
+	mixed := &Assessment{Protocols: strong, Certificates: cert, Ciphers: []Cipher{
+		{Name: "TLS_AES_128_GCM_SHA256", Strength: StrengthStrong, Forward: true},
+		{Name: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", Strength: StrengthStrong, Forward: true},
+		{Name: "TLS_RSA_WITH_AES_128_CBC_SHA", Strength: StrengthWeak, Forward: false},
+	}}
+	mixed.ForwardSecret = forwardSecret(mixed.Ciphers)
+	require.False(t, mixed.ForwardSecret, "not every key exchange is ephemeral")
+	_, letter, reasons := grade(mixed)
+	require.NotEqual(t, "B", letter)
+	require.NotContains(t, reasons, "no forward-secret key exchange offered")
+
+	none := &Assessment{Protocols: strong, Certificates: cert, Ciphers: []Cipher{
+		{Name: "TLS_RSA_WITH_AES_128_GCM_SHA256", Strength: StrengthStrong, Forward: false},
+	}}
+	_, letter, reasons = grade(none)
+	require.Equal(t, "B", letter)
+	require.Contains(t, reasons, "no forward-secret key exchange offered")
+}

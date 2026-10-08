@@ -164,6 +164,16 @@ func remove(ids []uint16, id uint16) []uint16 {
 	return out
 }
 
+// anyForward reports whether at least one accepted cipher has an ephemeral key exchange.
+func anyForward(ciphers []Cipher) bool {
+	for _, c := range ciphers {
+		if c.Forward {
+			return true
+		}
+	}
+	return false
+}
+
 func forwardSecret(ciphers []Cipher) bool {
 	if len(ciphers) == 0 {
 		return false

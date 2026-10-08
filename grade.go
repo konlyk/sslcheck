@@ -141,8 +141,11 @@ func applyCaps(letter string, a *Assessment) (string, []string) {
 	if offered["TLS1_1"] {
 		capTo("B", "TLS 1.1 offered")
 	}
-	if !a.ForwardSecret && len(a.Ciphers) > 0 {
-		capTo("B", "not all key exchanges are forward-secret")
+	// SSL Labs caps at B when forward secrecy is not supported at all. A host that also keeps
+	// some RSA key exchanges for old clients (most CDNs do) is not capped: modern clients
+	// negotiate a forward-secret suite with it.
+	if len(a.Ciphers) > 0 && !anyForward(a.Ciphers) {
+		capTo("B", "no forward-secret key exchange offered")
 	}
 	for _, c := range a.Ciphers {
 		if c.Strength != StrengthInsecure {
