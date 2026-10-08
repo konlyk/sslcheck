@@ -78,33 +78,100 @@ func ccsInjection(ctx context.Context, addr string, opts Options) bool {
 // session id that starts with the marker and is padded with memory, while a sound server echoes
 // nothing or exactly the marker.
 func ticketbleed(ctx context.Context, addr string, opts Options) bool {
+	// The flaw only shows on a resumption, so harvest a valid TLS 1.2 ticket from a normal
+	// handshake first.
+	ticket := harvestSessionTicket(ctx, addr, opts)
+	if len(ticket) == 0 {
+		return false // the server issues no session ticket: nothing to resume, not vulnerable
+	}
+	ticketExt := extension(0x0023, ticket)
+	sid := []byte{0x00, 0x0b, 0xad, 0xc0, 0xde, 0x00} // a short, fixed session id, as testssl sends
+	var memories [][]byte
+	for i := 0; i < 3; i++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		echoed := ticketbleedEcho(ctx, addr, opts, sid, ticketExt)
+		if len(echoed) != 32 || !bytes.Equal(echoed[:len(sid)], sid) {
+			return false // not the full-length echo of our short id that the flaw produces
+		}
+		memories = append(memories, append([]byte(nil), echoed[len(sid):]...))
+	}
+	// Vulnerable when the bytes past our short id differ between resumptions: they are leaked
+	// memory, not a stable value the server chose. Three matching echoes with differing tails is
+	// testssl's signature, so a server that returns a fixed 32-byte id is not mistaken for a leak.
+	return !bytes.Equal(memories[0], memories[1]) && !bytes.Equal(memories[1], memories[2])
+}
+
+// harvestSessionTicket completes one TLS 1.2 handshake and returns the session ticket the server
+// issued, or nil when it issues none. The ticket is captured through a client session cache; in
+// TLS 1.2 it arrives during the handshake, so it is set by the time Dial returns.
+func harvestSessionTicket(ctx context.Context, addr string, opts Options) []byte {
+	g := &ticketGrabber{}
+	d := &cryptotls.Dialer{Config: &cryptotls.Config{
+		ServerName: opts.ServerName, InsecureSkipVerify: true, //nolint:gosec // reading a ticket, not trusting
+		MinVersion: cryptotls.VersionTLS10, MaxVersion: cryptotls.VersionTLS12,
+		ClientSessionCache: g,
+	}}
+	cctx, cancel := context.WithTimeout(ctx, opts.timeout())
+	defer cancel()
+	conn, err := d.DialContext(cctx, "tcp", addr)
+	if err != nil {
+		return nil
+	}
+	_ = conn.Close()
+	return g.ticket
+}
+
+// ticketGrabber is a crypto/tls ClientSessionCache that keeps the first session ticket the server
+// sends.
+type ticketGrabber struct{ ticket []byte }
+
+func (g *ticketGrabber) Get(string) (*cryptotls.ClientSessionState, bool) { return nil, false }
+
+func (g *ticketGrabber) Put(_ string, cs *cryptotls.ClientSessionState) {
+	if cs == nil || g.ticket != nil {
+		return
+	}
+	if t, _, err := cs.ResumptionState(); err == nil {
+		g.ticket = t
+	}
+}
+
+// ticketbleedEcho sends a TLS 1.2 ClientHello that resumes ticket with the short session id and
+// returns the session id the server echoes in its ServerHello. It reads only up to the
+// ServerHello: a resumption follows it with a ChangeCipherSpec and an encrypted Finished, neither
+// of which the probe needs or can read.
+func ticketbleedEcho(ctx context.Context, addr string, opts Options, sid, ticketExt []byte) []byte {
 	r, err := dialRaw(ctx, addr, opts)
 	if err != nil {
-		return false
+		return nil
 	}
 	defer r.close()
-	marker := make([]byte, 32)
-	_, _ = rand.Read(marker[:1])
-	for i := 1; i < len(marker); i++ {
-		marker[i] = 0 // zeros, so leaked memory shows as non-zero trailing bytes
+	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, probeSuites, sid, ticketExt)); err != nil {
+		return nil
 	}
-	ticketExt := extension(0x0023, bytes.Repeat([]byte{0x00}, 32)) // session_ticket of 32 bytes
-	hello := clientHello(opts.ServerName, probeSuites, marker, ticketExt)
-	if err := r.writeRecord(recHandshake, 0x0301, hello); err != nil {
-		return false
+	var buf []byte
+	for {
+		typ, body, err := r.readRecord()
+		if err != nil {
+			return nil
+		}
+		if typ != recHandshake {
+			continue
+		}
+		buf = append(buf, body...)
+		for len(buf) >= 4 {
+			n := int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
+			if len(buf) < 4+n {
+				break
+			}
+			if buf[0] == hsServerHello {
+				return serverHelloSessionID(buf[4 : 4+n])
+			}
+			buf = buf[4+n:]
+		}
 	}
-	msgs, err := r.readUntilServerHelloDone()
-	if err != nil {
-		return false
-	}
-	sh := msgs[hsServerHello]
-	echoed := serverHelloSessionID(sh)
-	if len(echoed) != 32 || echoed[0] != marker[0] {
-		return false // no full-length echo of our marker
-	}
-	// A sound server that echoes a 32-byte id echoes our bytes (zeros after the marker); leaked
-	// memory shows as non-zero bytes we never sent.
-	return !bytes.Equal(echoed, marker)
 }
 
 // serverHelloSessionID pulls the session id out of a ServerHello body.
