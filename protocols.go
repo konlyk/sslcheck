@@ -4,7 +4,9 @@ import (
 	"context"
 	cryptotls "crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -79,14 +81,19 @@ func legacyHandshake(ctx context.Context, addr string, version uint16, suites []
 }
 
 // legacyHandshakeWith is legacyHandshake with the client config adjusted by tweak. A handshake
-// that gets no ServerHello and no TLS alert (a timeout, a reset) is tried up to three times, as a
-// dropped connection is not the server's answer; an alert is.
+// that gets no ServerHello and no TLS alert is retried, as a dropped connection is not the
+// server's answer; an alert is. A reset or a close is tried up to three times; a timeout only
+// twice, since a server that twice says nothing for the whole timeout has answered, and a third
+// wait would only make a silently dropping host cost three timeouts per probe.
 func legacyHandshakeWith(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
 	var log *ztls.ServerHandshake
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		log, err = legacyHandshakeOnce(ctx, addr, version, suites, opts, tweak)
 		if (log != nil && log.ServerHello != nil) || err == nil || isTLSAlert(err) || ctx.Err() != nil {
+			break
+		}
+		if isTimeout(err) && attempt >= 1 {
 			break
 		}
 	}
@@ -99,6 +106,12 @@ func isTLSAlert(err error) bool {
 	msg := err.Error()
 	// zcrypto's alert type is unexported; a server alert surfaces as "remote error: tls: …".
 	return strings.Contains(msg, "remote error") || strings.Contains(msg, "alert")
+}
+
+// isTimeout reports whether err is a network timeout (the connection deadline passed).
+func isTimeout(err error) bool {
+	var ne net.Error
+	return (errors.As(err, &ne) && ne.Timeout()) || strings.Contains(err.Error(), "i/o timeout")
 }
 
 func legacyHandshakeOnce(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
