@@ -41,17 +41,28 @@ func ccsInjection(ctx context.Context, addr string, opts Options) bool {
 	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, probeSuites, nil, nil)); err != nil {
 		return false
 	}
-	if _, err := r.readUntilServerHelloDone(); err != nil {
+	msgs, err := r.readUntilServerHelloDone()
+	if err != nil {
 		return false
 	}
-	// Send an early ChangeCipherSpec, which has no business here yet.
-	if err := r.writeRecord(recChangeCipher, 0x0303, []byte{0x01}); err != nil {
+	// Use the version the server chose for the ChangeCipherSpec records.
+	version := uint16(0x0303)
+	if sh := msgs[hsServerHello]; len(sh) >= 2 {
+		version = uint16(sh[0])<<8 | uint16(sh[1])
+	}
+	// Inject a ChangeCipherSpec before the key exchange. A patched server rejects the first with
+	// an unexpected-message or handshake-failure alert (or drops the connection); the vulnerable
+	// OpenSSL accepts it, derives keys from an empty master secret, and errors only on a following
+	// record. testssl sends the CCS twice and reads the answer to the second, so the probe does too.
+	ccs := []byte{0x01}
+	if err := r.writeRecord(recChangeCipher, version, ccs); err != nil {
 		return false
 	}
+	_ = r.writeRecord(recChangeCipher, version, ccs)
 	_, _, err = r.readRecord()
 	a, ok := asAlert(err)
 	if !ok {
-		return false // no alert we could read: not the vulnerable signature
+		return false // empty reply or plain handshake data, not the vulnerable signature: patched
 	}
 	switch a.code {
 	case 20, 21, 22: // bad_record_mac, decryption_failed, record_overflow: the vulnerable path
