@@ -3,6 +3,7 @@ package sslcheck
 import (
 	"context"
 	"crypto/rand"
+	cryptotls "crypto/tls"
 	"net"
 	"testing"
 
@@ -112,7 +113,7 @@ func TestTicketbleedEcho(t *testing.T) {
 		}
 		srvWrite(c, recHandshake, serverHelloMsg(0x002f, echoed, compressionNone, false))
 	})
-	got := ticketbleedEcho(context.Background(), addr, testOpts(), sid, extension(0x0023, make([]byte, 16)))
+	got := ticketbleedEcho(context.Background(), addr, testOpts(), probeSuites, sid, extension(0x0023, make([]byte, 16)))
 	require.Equal(t, echoed, got)
 }
 
@@ -121,4 +122,31 @@ func TestTicketbleedEcho(t *testing.T) {
 func TestTicketbleedNotVulnerable(t *testing.T) {
 	addr, _ := localServer(t, modernConfig())
 	require.False(t, ticketbleed(context.Background(), addr, testOpts()))
+}
+
+// The full probe against a server that behaves like a vulnerable F5: it issues a real ticket on
+// the first (genuine TLS) connection, then, on each resumption, echoes the short session id padded
+// to 32 bytes with different bytes every time. The same server echoing a fixed padding, or exactly
+// the id, is not vulnerable.
+func TestTicketbleedVulnerable(t *testing.T) {
+	cert, _, _ := testCert(t)
+	f5 := func(pad func(i int) []byte) string {
+		return scriptedServer(t, func(i int, c net.Conn) {
+			if i == 1 { // the ticket harvest: a genuine TLS 1.2 handshake that issues a ticket
+				srv := cryptotls.Server(c, &cryptotls.Config{Certificates: []cryptotls.Certificate{cert}, MaxVersion: cryptotls.VersionTLS12})
+				_ = srv.Handshake()
+				return
+			}
+			h, err := readClientHello(c)
+			if err != nil || !h.hasTicket || len(h.sid) == 0 || len(h.sid) >= 32 {
+				return
+			}
+			echoed := append(append([]byte(nil), h.sid...), pad(i)[:32-len(h.sid)]...)
+			srvWrite(c, recHandshake, serverHelloMsg(h.suites[0], echoed, compressionNone, false))
+		})
+	}
+	leaking := func(int) []byte { b := make([]byte, 32); _, _ = rand.Read(b); return b }
+	fixed := func(int) []byte { return make([]byte, 32) }
+	require.True(t, ticketbleed(context.Background(), f5(leaking), testOpts()), "memory differs on every resumption")
+	require.False(t, ticketbleed(context.Background(), f5(fixed), testOpts()), "a stable padding is not a leak")
 }

@@ -69,25 +69,26 @@ func ccsInjection(ctx context.Context, addr string, opts Options) bool {
 }
 
 // ticketbleed reports whether an F5 BIG-IP returns uninitialised memory in the session id it
-// echoes for a crafted session ticket (CVE-2016-9244). The probe sends a one-byte marker as the
-// session id with an (invalid) session-ticket extension; a vulnerable server echoes a 32-byte
-// session id that starts with the marker and is padded with memory, while a sound server echoes
-// nothing or exactly the marker.
+// echoes when resuming a session ticket (CVE-2016-9244). The flaw only shows on a resumption, so
+// the probe first completes a normal handshake to harvest a valid TLS 1.2 ticket, then resumes
+// with that ticket and a short session id. A vulnerable server echoes a 32-byte session id that
+// begins with the short id and is padded with memory; a sound server echoes nothing, or exactly
+// the id.
 func ticketbleed(ctx context.Context, addr string, opts Options) bool {
-	// The flaw only shows on a resumption, so harvest a valid TLS 1.2 ticket from a normal
-	// handshake first.
-	ticket := harvestSessionTicket(ctx, addr, opts)
+	ticket, suite := harvestSessionTicket(ctx, addr, opts)
 	if len(ticket) == 0 {
 		return false // the server issues no session ticket: nothing to resume, not vulnerable
 	}
 	ticketExt := extension(0x0023, ticket)
+	// A server resumes only into the suite the ticket was issued for, so offer that one first.
+	suites := append([]uint16{suite}, probeSuites...)
 	sid := []byte{0x00, 0x0b, 0xad, 0xc0, 0xde, 0x00} // a short, fixed session id, as testssl sends
 	var memories [][]byte
 	for range 3 {
 		if ctx.Err() != nil {
 			return false
 		}
-		echoed := ticketbleedEcho(ctx, addr, opts, sid, ticketExt)
+		echoed := ticketbleedEcho(ctx, addr, opts, suites, sid, ticketExt)
 		if len(echoed) != 32 || !bytes.Equal(echoed[:len(sid)], sid) {
 			return false // not the full-length echo of our short id that the flaw produces
 		}
@@ -100,9 +101,10 @@ func ticketbleed(ctx context.Context, addr string, opts Options) bool {
 }
 
 // harvestSessionTicket completes one TLS 1.2 handshake and returns the session ticket the server
-// issued, or nil when it issues none. The ticket is captured through a client session cache; in
-// TLS 1.2 it arrives during the handshake, so it is set by the time Dial returns.
-func harvestSessionTicket(ctx context.Context, addr string, opts Options) []byte {
+// issued (nil when it issues none) and the suite the session used. The ticket is captured through
+// a client session cache; in TLS 1.2 it arrives during the handshake, so it is set by the time
+// Dial returns.
+func harvestSessionTicket(ctx context.Context, addr string, opts Options) (ticket []byte, suite uint16) {
 	g := &ticketGrabber{}
 	d := &cryptotls.Dialer{Config: &cryptotls.Config{
 		ServerName: opts.ServerName, InsecureSkipVerify: true, //nolint:gosec // reading a ticket, not trusting
@@ -113,10 +115,11 @@ func harvestSessionTicket(ctx context.Context, addr string, opts Options) []byte
 	defer cancel()
 	conn, err := d.DialContext(cctx, "tcp", addr)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
+	suite = conn.(*cryptotls.Conn).ConnectionState().CipherSuite
 	_ = conn.Close()
-	return g.ticket
+	return g.ticket, suite
 }
 
 // ticketGrabber is a crypto/tls ClientSessionCache that keeps the first session ticket the server
@@ -134,17 +137,17 @@ func (g *ticketGrabber) Put(_ string, cs *cryptotls.ClientSessionState) {
 	}
 }
 
-// ticketbleedEcho sends a TLS 1.2 ClientHello that resumes ticket with the short session id and
-// returns the session id the server echoes in its ServerHello. It reads only up to the
-// ServerHello: a resumption follows it with a ChangeCipherSpec and an encrypted Finished, neither
-// of which the probe needs or can read.
-func ticketbleedEcho(ctx context.Context, addr string, opts Options, sid, ticketExt []byte) []byte {
+// ticketbleedEcho sends a TLS 1.2 ClientHello offering suites that resumes ticket with the short
+// session id, and returns the session id the server echoes in its ServerHello. It reads only up to
+// the ServerHello: a resumption follows it with a ChangeCipherSpec and an encrypted Finished,
+// neither of which the probe needs or can read.
+func ticketbleedEcho(ctx context.Context, addr string, opts Options, suites []uint16, sid, ticketExt []byte) []byte {
 	r, err := dialRaw(ctx, addr, opts)
 	if err != nil {
 		return nil
 	}
 	defer r.close()
-	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, probeSuites, sid, ticketExt)); err != nil {
+	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, suites, sid, ticketExt)); err != nil {
 		return nil
 	}
 	var buf []byte
