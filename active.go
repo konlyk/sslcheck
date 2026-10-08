@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	cryptotls "crypto/tls"
 	"math/big"
+	"time"
 )
 
 // The active probes send crafted handshake records and read a flaw from how the server answers,
@@ -44,10 +45,7 @@ func ccsInjection(ctx context.Context, addr string, opts Options) bool {
 		return false
 	}
 	// Use the version the server chose for the ChangeCipherSpec records.
-	version := uint16(0x0303)
-	if sh := msgs[hsServerHello]; len(sh) >= 2 {
-		version = uint16(sh[0])<<8 | uint16(sh[1])
-	}
+	version := negotiatedVersion(msgs, 0x0303)
 	// Inject a ChangeCipherSpec before the key exchange. A patched server rejects the first with
 	// an unexpected-message or handshake-failure alert (or drops the connection); the vulnerable
 	// OpenSSL accepts it, derives keys from an empty master secret, and errors only on a following
@@ -172,6 +170,17 @@ func ticketbleedEcho(ctx context.Context, addr string, opts Options, sid, ticket
 	}
 }
 
+// robotReadTimeout bounds the wait for the server's answer to a crafted key exchange.
+const robotReadTimeout = 5 * time.Second
+
+// negotiatedVersion is the protocol version in the ServerHello among msgs, or fallback.
+func negotiatedVersion(msgs map[byte][]byte, fallback uint16) uint16 {
+	if sh := msgs[hsServerHello]; len(sh) >= 2 {
+		return uint16(sh[0])<<8 | uint16(sh[1])
+	}
+	return fallback
+}
+
 // serverHelloSessionID pulls the session id out of a ServerHello body.
 func serverHelloSessionID(sh []byte) []byte {
 	if len(sh) < 2+32+1 { // version + random + id length
@@ -225,7 +234,7 @@ func robotBattery(ctx context.Context, addr string, opts Options, pub *rsa.Publi
 		if ctx.Err() != nil {
 			return nil, false
 		}
-		r, ok := robotResponse(ctx, addr, opts, pub, p, version)
+		r, ok := robotResponse(ctx, addr, opts, pub, p)
 		if !ok {
 			return nil, false
 		}
@@ -297,7 +306,7 @@ func robotProbes(size int, version uint16) [][]byte {
 // robotResponse sends one crafted RSA ClientKeyExchange and reports how the server answered,
 // classified coarsely (an alert code, "data" for a plaintext record, or "closed"). ok is false
 // only when the probe could not be delivered at all, which the caller treats as inconclusive.
-func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, block []byte, version uint16) (string, bool) {
+func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, block []byte) (string, bool) {
 	r, err := dialRaw(ctx, addr, opts)
 	if err != nil {
 		return "", false
@@ -306,9 +315,13 @@ func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.Publ
 	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, rsaKexSuites, nil, nil)); err != nil {
 		return "", false
 	}
-	if _, err := r.readUntilServerHelloDone(); err != nil {
+	msgs, err := r.readUntilServerHelloDone()
+	if err != nil {
 		return "", false
 	}
+	// The records after the hello carry the version the server chose (the premaster inside keeps
+	// the offered one, which is what a checking server compares against).
+	version := negotiatedVersion(msgs, 0x0303)
 	enc := rsaEncryptBlock(pub, block)
 	cke := handshakeMessage(16, append(uint16b(len(enc)), enc...)) // 16 = client_key_exchange
 	if err := r.writeRecord(recHandshake, version, cke); err != nil {
@@ -316,6 +329,9 @@ func robotResponse(ctx context.Context, addr string, opts Options, pub *rsa.Publ
 	}
 	_ = r.writeRecord(recChangeCipher, version, []byte{0x01})
 	_ = r.writeRecord(recHandshake, version, bytes.Repeat([]byte{0x00}, 40)) // a dummy encrypted Finished
+	// A server that never answers the bogus Finished is not an oracle; do not wait the full
+	// connection timeout for it five times over (testssl waits 5 seconds).
+	r.timeout = min(r.timeout, robotReadTimeout)
 	_, _, err = r.readRecord()
 	if a, ok := asAlert(err); ok {
 		return "alert-" + itoaByte(a.code), true
