@@ -106,18 +106,15 @@ func ticketbleed(ctx context.Context, addr string, opts Options) bool {
 // Dial returns.
 func harvestSessionTicket(ctx context.Context, addr string, opts Options) (ticket []byte, suite uint16) {
 	g := &ticketGrabber{}
-	d := &cryptotls.Dialer{Config: &cryptotls.Config{
+	conn, err := tlsClient(ctx, addr, &cryptotls.Config{
 		ServerName: opts.ServerName, InsecureSkipVerify: true, //nolint:gosec // reading a ticket, not trusting
 		MinVersion: cryptotls.VersionTLS10, MaxVersion: cryptotls.VersionTLS12,
 		ClientSessionCache: g,
-	}}
-	cctx, cancel := context.WithTimeout(ctx, opts.timeout())
-	defer cancel()
-	conn, err := d.DialContext(cctx, "tcp", addr)
+	}, opts)
 	if err != nil {
 		return nil, 0
 	}
-	suite = conn.(*cryptotls.Conn).ConnectionState().CipherSuite
+	suite = conn.ConnectionState().CipherSuite
 	_ = conn.Close()
 	return g.ticket, suite
 }

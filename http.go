@@ -22,8 +22,8 @@ type HTTPHeaders struct {
 // the headers of the first answer are what a browser would pin or remember.
 func fetchHTTPHeaders(ctx context.Context, host, addr string, opts Options) *HTTPHeaders {
 	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: opts.timeout()}).DialContext(ctx, network, addr)
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dial(ctx, addr, opts) // to the chosen address, under the connection cap
 		},
 		// TLS 1.0 as the floor: a host that offers nothing newer still has HSTS to read.
 		TLSClientConfig:   &cryptotls.Config{ServerName: opts.ServerName, InsecureSkipVerify: true, MinVersion: cryptotls.VersionTLS10}, //nolint:gosec // reading headers, not trusting

@@ -68,8 +68,9 @@ func offersVersion(ctx context.Context, addr string, version uint16, opts Option
 		return true
 	default:
 		// Offered when the server answers with a ServerHello at that version, whether or not the
-		// rest of the handshake completes.
-		log, _ := legacyHandshake(ctx, addr, version, cipherIDs(), opts)
+		// rest of the handshake completes. A missed protocol changes the grade, so this probe is
+		// given the full three attempts even when the failures are timeouts.
+		log, _ := handshakeAttempts(ctx, addr, version, cipherIDs(), opts, nil, 3)
 		return log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version
 	}
 }
@@ -86,15 +87,25 @@ func legacyHandshake(ctx context.Context, addr string, version uint16, suites []
 // twice, since a server that twice says nothing for the whole timeout has answered, and a third
 // wait would only make a silently dropping host cost three timeouts per probe.
 func legacyHandshakeWith(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
+	return handshakeAttempts(ctx, addr, version, suites, opts, tweak, 2)
+}
+
+// handshakeAttempts makes up to three handshake attempts, stopping at the first that yields a
+// ServerHello or a TLS alert, and after maxTimeouts of them have timed out.
+func handshakeAttempts(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config), maxTimeouts int) (*ztls.ServerHandshake, error) {
 	var log *ztls.ServerHandshake
 	var err error
+	timeouts := 0
 	for attempt := 0; attempt < 3; attempt++ {
 		log, err = legacyHandshakeOnce(ctx, addr, version, suites, opts, tweak)
 		if (log != nil && log.ServerHello != nil) || err == nil || isTLSAlert(err) || ctx.Err() != nil {
 			break
 		}
-		if isTimeout(err) && attempt >= 1 {
-			break
+		if isTimeout(err) {
+			timeouts++
+			if timeouts >= maxTimeouts {
+				break
+			}
 		}
 	}
 	return log, err
@@ -136,15 +147,10 @@ func legacyHandshakeOnce(ctx context.Context, addr string, version uint16, suite
 
 // tls13Dial completes a TLS 1.3 handshake through crypto/tls, which zcrypto cannot speak.
 func tls13Dial(ctx context.Context, addr string, opts Options) (*cryptotls.Conn, error) {
-	d := &cryptotls.Dialer{Config: &cryptotls.Config{
+	return tlsClient(ctx, addr, &cryptotls.Config{
 		MinVersion: cryptotls.VersionTLS13, MaxVersion: cryptotls.VersionTLS13,
-		ServerName: opts.ServerName, InsecureSkipVerify: true,
-	}}
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return conn.(*cryptotls.Conn), nil
+		ServerName: opts.ServerName, InsecureSkipVerify: true, //nolint:gosec // detection only
+	}, opts)
 }
 
 // tls13Ciphers reports the TLS 1.3 suites the host negotiates. crypto/tls will not let a client

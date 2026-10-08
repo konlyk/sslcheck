@@ -116,15 +116,12 @@ func certHandshake(ctx context.Context, addr string, opts Options, suites []uint
 	if suites != nil {
 		cfg.MaxVersion, cfg.CipherSuites = cryptotls.VersionTLS12, suites
 	}
-	d := &cryptotls.Dialer{NetDialer: nil, Config: cfg}
-	cctx, cancel := context.WithTimeout(ctx, opts.timeout())
-	defer cancel()
-	conn, err := d.DialContext(cctx, "tcp", addr)
+	conn, err := tlsClient(ctx, addr, cfg, opts)
 	if err != nil {
 		return nil, nil
 	}
 	defer conn.Close()
-	st := conn.(*cryptotls.Conn).ConnectionState()
+	st := conn.ConnectionState()
 	return st.PeerCertificates, st.OCSPResponse
 }
 

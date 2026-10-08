@@ -75,6 +75,7 @@ type Options struct {
 	Roots           *x509.CertPool // trust anchors for the certificate verdict; nil = the system roots
 	CheckRevocation bool           // also ask the certificate's OCSP responder (a stapled response is always read)
 	SkipHTTP        bool           // skip the HTTP request that reads HSTS and HPKP, for non-HTTP services
+	MaxConnections  int            // connections held open to the host at once; 0 = 6
 }
 ```
 

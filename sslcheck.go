@@ -9,6 +9,7 @@ package sslcheck
 
 import (
 	"context"
+	cryptotls "crypto/tls"
 	"crypto/x509"
 	"net"
 	"sync"
@@ -103,6 +104,12 @@ type Options struct {
 	CheckRevocation bool
 	// SkipHTTP leaves out the HTTP request that reads HSTS and HPKP, for non-HTTP services.
 	SkipHTTP bool
+	// MaxConnections caps how many connections the scan holds open to the host at once; 0 = 6.
+	// Some hosts and CDNs drop a burst of connections, and a dropped probe reads as "not offered",
+	// so the cap trades a little speed for a stable answer.
+	MaxConnections int
+
+	limiter chan struct{} // set by Scan from MaxConnections; a channel, so every copy shares it
 }
 
 func (o Options) timeout() time.Duration {
@@ -112,12 +119,20 @@ func (o Options) timeout() time.Duration {
 	return 10 * time.Second
 }
 
+func (o Options) maxConnections() int {
+	if o.MaxConnections > 0 {
+		return o.MaxConnections
+	}
+	return 6
+}
+
 // Scan assesses the TLS of host at addr ("ip:port"). host is the name for SNI and certificate
 // matching; addr carries the chosen IP so the caller controls which address is probed.
 func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, error) {
 	if opts.ServerName == "" {
 		opts.ServerName = host
 	}
+	opts.limiter = make(chan struct{}, opts.maxConnections())
 	a := &Assessment{}
 	a.Protocols = scanProtocols(ctx, addr, opts)
 	if !anyOffered(a.Protocols) {
@@ -153,8 +168,52 @@ func anyOffered(ps []Protocol) bool {
 	return false
 }
 
-// dial opens a TCP connection to addr under ctx and the per-connection timeout.
+// dial opens a TCP connection to addr under ctx and the per-connection timeout. Every connection
+// the scan makes comes through here, so it is where the per-host connection cap is enforced: a
+// slot is taken before dialling and given back when the connection is closed.
 func dial(ctx context.Context, addr string, opts Options) (net.Conn, error) {
+	release := func() {}
+	if opts.limiter != nil {
+		select {
+		case opts.limiter <- struct{}{}:
+			release = func() { <-opts.limiter }
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	d := &net.Dialer{Timeout: opts.timeout()}
-	return d.DialContext(ctx, "tcp", addr)
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &limitedConn{Conn: conn, release: release}, nil
+}
+
+// limitedConn gives its connection slot back on Close, once.
+type limitedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitedConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
+}
+
+// tlsClient runs a crypto/tls client handshake over a connection from dial, so the TLS 1.3,
+// certificate and ticket handshakes count against the connection cap like every other probe.
+func tlsClient(ctx context.Context, addr string, cfg *cryptotls.Config, opts Options) (*cryptotls.Conn, error) {
+	conn, err := dial(ctx, addr, opts)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(opts.timeout()))
+	tc := cryptotls.Client(conn, cfg)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		_ = tc.Close()
+		return nil, err
+	}
+	return tc, nil
 }
