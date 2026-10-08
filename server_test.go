@@ -2,12 +2,8 @@ package sslcheck
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	cryptotls "crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"math/big"
 	"testing"
 	"time"
 
@@ -21,43 +17,9 @@ import (
 // all exercised end to end.
 func localServer(t *testing.T, cfg *cryptotls.Config) (addr string, roots *x509.CertPool) {
 	t.Helper()
-	// A self-signed root CA, and a leaf it signs for "localhost"; the server presents the leaf and
-	// the test trusts the root, so the leaf is a normal, trusted, non-self-signed certificate.
-	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	caTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "sslcheck test CA", Organization: []string{"sslcheck test"}},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageCertSign,
-		IsCA:         true, BasicConstraintsValid: true,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	require.NoError(t, err)
-	ca, err := x509.ParseCertificate(caDER)
-	require.NoError(t, err)
-
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-	leafTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		DNSNames:     []string{"localhost"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, leafTmpl, ca, &key.PublicKey, caKey)
-	require.NoError(t, err)
-	leaf, err := x509.ParseCertificate(der)
-	require.NoError(t, err)
-	roots = x509.NewCertPool()
-	roots.AddCert(ca)
-
+	cert, roots, _ := testCert(t)
 	cfg = cfg.Clone()
-	cfg.Certificates = []cryptotls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}
+	cfg.Certificates = []cryptotls.Certificate{cert}
 	ln, err := cryptotls.Listen("tcp", "127.0.0.1:0", cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })

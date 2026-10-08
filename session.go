@@ -20,15 +20,18 @@ func scanSessionFeatures(ctx context.Context, addr string, protocols []Protocol,
 	if version == 0 {
 		return false, nil
 	}
-	if log, err := legacyHandshake(ctx, addr, version, cipherIDs(), opts); err == nil && log != nil && log.ServerHello != nil {
+	// The ServerHello carries both answers, so it counts whether or not zcrypto finishes the
+	// handshake after it (it will not when the server picks a suite it cannot complete, and it
+	// never does when the server picks DEFLATE, which it does not implement).
+	if log, _ := legacyHandshake(ctx, addr, version, cipherIDs(), opts); log != nil && log.ServerHello != nil {
 		v := log.ServerHello.SecureRenegotiation
 		secureReneg = &v
 	}
 	// Offer DEFLATE first: a server that compresses picks it.
-	log, err := legacyHandshakeWith(ctx, addr, version, cipherIDs(), opts, func(c *ztls.Config) {
+	log, _ := legacyHandshakeWith(ctx, addr, version, cipherIDs(), opts, func(c *ztls.Config) {
 		c.CompressionMethods = []uint8{compressionDeflate, compressionNone}
 	})
-	if err == nil && log != nil && log.ServerHello != nil {
+	if log != nil && log.ServerHello != nil {
 		compression = uint8(log.ServerHello.CompressionMethod) == compressionDeflate
 	}
 	return compression, secureReneg
