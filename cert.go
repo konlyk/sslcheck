@@ -49,6 +49,47 @@ func scanCertificates(ctx context.Context, host, addr string, opts Options) []Ce
 		// still speaks them.
 		add(certFromLegacy(ctx, addr, opts), nil)
 	}
+	if len(out) == 0 {
+		// Not even zcrypto can complete a handshake (a NULL- or anonymous-only host): the raw
+		// client still reads the Certificate message out of the server's first flight.
+		add(rawChain(ctx, addr, opts), nil)
+	}
+	return out
+}
+
+// rawChain is the chain in the Certificate message a raw TLS 1.2 handshake offering every known
+// suite gets back. It needs no cipher implementation, so it works whatever the host accepts.
+func rawChain(ctx context.Context, addr string, opts Options) []*x509.Certificate {
+	r, err := dialRaw(ctx, addr, opts)
+	if err != nil {
+		return nil
+	}
+	defer r.close()
+	if err := r.writeRecord(recHandshake, 0x0301, clientHello(opts.ServerName, cipherIDs(), nil, nil)); err != nil {
+		return nil
+	}
+	msgs, _ := r.readUntilServerHelloDone() // whatever arrived before any failure still counts
+	return certificatesFromMessage(msgs[hsCertificate])
+}
+
+// certificatesFromMessage parses the certificates in a TLS Certificate handshake message, leaf
+// first, skipping any that do not parse.
+func certificatesFromMessage(msg []byte) []*x509.Certificate {
+	if len(msg) < 3 {
+		return nil
+	}
+	list := msg[3:] // after the 3-byte list length
+	var out []*x509.Certificate
+	for len(list) >= 3 {
+		n := int(list[0])<<16 | int(list[1])<<8 | int(list[2])
+		if len(list) < 3+n {
+			break
+		}
+		if c, err := x509.ParseCertificate(list[3 : 3+n]); err == nil {
+			out = append(out, c)
+		}
+		list = list[3+n:]
+	}
 	return out
 }
 

@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	cryptotls "crypto/tls"
-	"crypto/x509"
 	"math/big"
 )
 
@@ -255,22 +254,14 @@ func rsaKexPubKey(ctx context.Context, addr string, opts Options) *rsa.PublicKey
 	return leafRSAKey(msgs[hsCertificate])
 }
 
-// leafRSAKey parses the leaf out of a TLS Certificate handshake message and returns its RSA public
-// key, or nil when the leaf is absent or not an RSA key.
+// leafRSAKey is the RSA public key of the leaf in a TLS Certificate handshake message, or nil when
+// the leaf is absent or not an RSA key.
 func leafRSAKey(cert []byte) *rsa.PublicKey {
-	if len(cert) < 6 { // 3-byte list length + 3-byte first-certificate length
+	chain := certificatesFromMessage(cert)
+	if len(chain) == 0 {
 		return nil
 	}
-	list := cert[3:]
-	n := int(list[0])<<16 | int(list[1])<<8 | int(list[2])
-	if len(list) < 3+n {
-		return nil
-	}
-	c, err := x509.ParseCertificate(list[3 : 3+n])
-	if err != nil {
-		return nil
-	}
-	pub, _ := c.PublicKey.(*rsa.PublicKey)
+	pub, _ := chain[0].PublicKey.(*rsa.PublicKey)
 	return pub
 }
 
