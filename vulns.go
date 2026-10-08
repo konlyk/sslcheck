@@ -40,7 +40,7 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 		}
 	}
 	var hasRC4, hasExportRSA, hasExportDH, has3DES, hasCBC, hasNULL, hasAnon bool
-	beastAtTLS10 := false
+	beastCBC := false // CBC at SSLv3 or TLS 1.0, the protocols BEAST applies to
 	for _, c := range a.Ciphers {
 		n := strings.ToUpper(c.Name)
 		hasRC4 = hasRC4 || has(n, "RC4")
@@ -55,8 +55,8 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 				hasExportRSA = true
 			}
 		}
-		if c.Version == "TLS1" && has(n, "_CBC_") {
-			beastAtTLS10 = true
+		if (c.Version == "TLS1" || c.Version == "SSLv3") && has(n, "_CBC_") {
+			beastCBC = true
 		}
 	}
 	if hasExportRSA {
@@ -74,8 +74,8 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 	if hasRC4 {
 		add(Vuln{"RC4", "MEDIUM", "CVE-2013-2566 CVE-2015-2808", "CWE-310", "the RC4 cipher is accepted"})
 	}
-	if beastAtTLS10 {
-		add(Vuln{"BEAST", "LOW", "CVE-2011-3389", "CWE-20", "CBC ciphers are offered on TLS 1.0"})
+	if beastCBC {
+		add(Vuln{"BEAST", "LOW", "CVE-2011-3389", "CWE-20", "CBC ciphers are offered on SSLv3 or TLS 1.0"})
 	}
 	if hasCBC {
 		add(Vuln{"LUCKY13", "LOW", "CVE-2013-0169", "CWE-310", "a CBC cipher is accepted"})
