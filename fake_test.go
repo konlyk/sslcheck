@@ -127,9 +127,11 @@ func readClientHello(c net.Conn) (helloInfo, error) {
 		return h, io.ErrUnexpectedEOF
 	}
 	b := body[4:]
-	at := func(n int) []byte {
-		if len(b) < n {
-			panic("short ClientHello")
+	short := false
+	at := func(n int) []byte { // the next n bytes, or zeros (and a flag) when the hello is short
+		if short || len(b) < n {
+			short = true
+			return make([]byte, n)
 		}
 		v := b[:n]
 		b = b[n:]
@@ -138,6 +140,9 @@ func readClientHello(c net.Conn) (helloInfo, error) {
 	at(2 + 32) // version, random
 	h.sid = append([]byte(nil), at(int(at(1)[0]))...)
 	suites := at(int(binary.BigEndian.Uint16(at(2))))
+	if short {
+		return h, io.ErrUnexpectedEOF
+	}
 	for i := 0; i+1 < len(suites); i += 2 {
 		s := uint16(suites[i])<<8 | uint16(suites[i+1])
 		if s == 0x00ff {
@@ -146,6 +151,9 @@ func readClientHello(c net.Conn) (helloInfo, error) {
 		h.suites = append(h.suites, s)
 	}
 	h.compressions = append([]byte(nil), at(int(at(1)[0]))...)
+	if short {
+		return h, io.ErrUnexpectedEOF
+	}
 	if len(b) < 2 {
 		return h, nil
 	}
