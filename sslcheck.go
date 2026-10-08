@@ -60,8 +60,8 @@ type Cipher struct {
 
 // Certificate is one certificate the host serves.
 type Certificate struct {
-	Leaf              *x509.Certificate
-	Chain             []*x509.Certificate // as served, leaf first
+	Leaf              *x509.Certificate   `json:"-"` // the parsed leaf, for callers; too large to serialise
+	Chain             []*x509.Certificate `json:"-"` // as served, leaf first; for callers, not serialised
 	CommonName        string
 	AltNames          []string
 	Issuer            string
