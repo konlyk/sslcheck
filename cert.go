@@ -266,28 +266,6 @@ func revoked(ctx context.Context, leaf *x509.Certificate, chain []*x509.Certific
 	return false, ""
 }
 
-func httpGet(ctx context.Context, url string, opts Options) []byte {
-	cctx, cancel := context.WithTimeout(ctx, opts.timeout())
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil
-	}
-	return body
-}
-
 func fingerprint(c *x509.Certificate) string {
 	sum := sha256.Sum256(c.Raw)
 	var b strings.Builder

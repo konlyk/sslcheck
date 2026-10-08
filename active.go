@@ -86,7 +86,7 @@ func ticketbleed(ctx context.Context, addr string, opts Options) bool {
 	ticketExt := extension(0x0023, ticket)
 	sid := []byte{0x00, 0x0b, 0xad, 0xc0, 0xde, 0x00} // a short, fixed session id, as testssl sends
 	var memories [][]byte
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if ctx.Err() != nil {
 			return false
 		}
