@@ -86,7 +86,7 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 	}
 
 	// Active probes.
-	if ctx.Err() == nil && heartbleed(ctx, addr, opts) {
+	if ctx.Err() == nil && heartbleed(ctx, addr, legacyCipherIDs(a.Ciphers), opts) {
 		add(Vuln{"HEARTBLEED", "CRITICAL", "CVE-2014-0160", "CWE-119", "the server returns memory to a malformed heartbeat"})
 	}
 	if ctx.Err() == nil && ccsInjection(ctx, addr, opts) {
@@ -104,8 +104,12 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 }
 
 // heartbleed reports whether the host bleeds memory in answer to a malformed heartbeat. zcrypto
-// has the check built in; the module only has to turn the heartbeat extension on and ask.
-func heartbleed(ctx context.Context, addr string, opts Options) bool {
+// has the check built in; the module only has to turn the heartbeat extension on and ask. It
+// offers the suites the host was seen to accept (forced, so zcrypto presents them even when they
+// are not its own defaults), so a server that shares none of zcrypto's default suites — an RC4- or
+// 3DES-only host, which is just the sort of old OpenSSL that bleeds — still completes the
+// handshake the heartbeat rides on.
+func heartbleed(ctx context.Context, addr string, suites []uint16, opts Options) bool {
 	conn, err := dial(ctx, addr, opts)
 	if err != nil {
 		return false
@@ -113,11 +117,26 @@ func heartbleed(ctx context.Context, addr string, opts Options) bool {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(opts.timeout()))
 	cfg := &ztls.Config{MaxVersion: ztls.VersionTLS12, HeartbeatEnabled: true, InsecureSkipVerify: true, ServerName: opts.ServerName}
+	if len(suites) > 0 {
+		cfg.CipherSuites, cfg.ForceSuites = suites, true
+	}
 	c := ztls.Client(conn, cfg)
 	if _, err := c.CheckHeartbleed(make([]byte, 256)); err == ztls.HeartbleedError {
 		return c.GetHeartbleedLog() != nil && c.GetHeartbleedLog().Vulnerable
 	}
 	return false
+}
+
+// legacyCipherIDs are the ids of the accepted ciphers below TLS 1.3, which is as high as the
+// heartbeat (and zcrypto) goes.
+func legacyCipherIDs(cs []Cipher) []uint16 {
+	var out []uint16
+	for _, c := range cs {
+		if c.Version != "TLS1_3" {
+			out = append(out, c.ID)
+		}
+	}
+	return out
 }
 
 // dhPrimeBits is the size of the DH group the host uses, or 0 when it negotiates no DHE cipher.
