@@ -25,7 +25,8 @@ func fetchHTTPHeaders(ctx context.Context, host, addr string, opts Options) *HTT
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: opts.timeout()}).DialContext(ctx, network, addr)
 		},
-		TLSClientConfig:   &cryptotls.Config{ServerName: opts.ServerName, InsecureSkipVerify: true}, //nolint:gosec // reading headers, not trusting
+		// TLS 1.0 as the floor: a host that offers nothing newer still has HSTS to read.
+		TLSClientConfig:   &cryptotls.Config{ServerName: opts.ServerName, InsecureSkipVerify: true, MinVersion: cryptotls.VersionTLS10}, //nolint:gosec // reading headers, not trusting
 		DisableKeepAlives: true,
 	}
 	defer tr.CloseIdleConnections()
