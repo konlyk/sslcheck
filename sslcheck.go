@@ -18,12 +18,26 @@ import (
 type Assessment struct {
 	Protocols     []Protocol    // every version, offered or not
 	Ciphers       []Cipher      // the accepted ciphers, best protocol first
-	Certificates  []Certificate // the chains the host serves, leaf first
+	Certificates  []Certificate // one per certificate type served (RSA, ECDSA …), leaf described
 	ForwardSecret bool          // every accepted key exchange is ephemeral
 	Vulns         []Vuln        // the weaknesses found
-	Grade         string        // SSL Labs: A+ … F, or M (name mismatch) / T (not trusted)
-	Score         int           // SSL Labs score 0–100, capped by the grade
-	Reasons       []string      // why the grade is capped
+
+	// Compression is whether the server agreed to TLS-level compression (CRIME).
+	Compression bool
+	// SecureRenegotiation is whether the server supports RFC 5746 secure renegotiation; nil when
+	// it offers no protocol below TLS 1.3, where renegotiation does not exist.
+	SecureRenegotiation *bool
+	// HTTP is what the server's HTTP answer says about TLS (HSTS, HPKP); nil when not fetched.
+	HTTP *HTTPHeaders
+
+	// The rating, as testssl computes it from SSL Labs's SSL Server Rating Guide.
+	Grade               string   // A+ … F, M (name mismatch) or T (not trusted)
+	Score               int      // 0–100; 0 when the grade is F, T or M
+	ProtocolScore       int      // category 1, protocol support
+	KeyExchangeScore    int      // category 2, key exchange
+	CipherStrengthScore int      // category 3, cipher strength
+	Reasons             []string // the caps applied, worst first
+	Warnings            []string // what keeps an A from an A+ (it is then an A-)
 }
 
 // Protocol is one SSL/TLS version and whether the host offers it.
@@ -47,17 +61,28 @@ type Cipher struct {
 // Certificate is one certificate the host serves.
 type Certificate struct {
 	Leaf              *x509.Certificate
+	Chain             []*x509.Certificate // as served, leaf first
 	CommonName        string
 	AltNames          []string
 	Issuer            string
 	Trusted           bool
 	NameMismatch      bool // the certificate is otherwise fine but not for this hostname
 	TrustReason       string
-	ChainComplete     bool // the host sent the intermediates to a trusted root
+	ChainComplete     bool   // the host sent the intermediates to a trusted root
+	ChainIncomplete   bool   // an issuer is neither served nor a trusted root (OpenSSL codes 20/21)
+	ChainError        string // why the chain fails, as testssl words OpenSSL's verify result
+	SelfSigned        bool
 	FingerprintSHA256 string
 	KeyType           string // "RSA 2048", "EC P-256"
+	KeyAlg            string // "RSA", "EC", "DSA", "EdDSA"
+	KeyBits           int    // RSA/DSA modulus or EC curve size; Ed25519 253
+	RSAExponent       int    // RSA public exponent; 0 for other keys
 	SignatureAlg      string
+	SignatureHash     string // "SHA1", "SHA256", "MD5", "MD2" …
 	Expires           time.Time
+	OCSPStapled       bool
+	Revoked           bool   // stapled OCSP, or (Options.CheckRevocation) the responder, says revoked
+	RevocationSource  string // "stapled OCSP" or the responder's URL
 }
 
 // Expired reports whether the certificate's validity has passed.
@@ -68,6 +93,11 @@ type Options struct {
 	Timeout    time.Duration  // per connection; 0 = 10s
 	ServerName string         // SNI; defaults to the host
 	Roots      *x509.CertPool // trust anchors; nil = the system's
+	// CheckRevocation also asks the certificate's OCSP responder, as testssl's --phone-out does.
+	// A stapled OCSP response is always read.
+	CheckRevocation bool
+	// SkipHTTP leaves out the HTTP request that reads HSTS and HPKP, for non-HTTP services.
+	SkipHTTP bool
 }
 
 func (o Options) timeout() time.Duration {
@@ -91,8 +121,12 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	a.Ciphers = scanCiphers(ctx, addr, a.Protocols, opts)
 	a.ForwardSecret = forwardSecret(a.Ciphers)
 	a.Certificates = scanCertificates(ctx, host, addr, opts)
+	a.Compression, a.SecureRenegotiation = scanSessionFeatures(ctx, addr, a.Protocols, opts)
+	if !opts.SkipHTTP {
+		a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts)
+	}
 	a.Vulns = scanVulns(ctx, host, addr, a, opts)
-	a.Score, a.Grade, a.Reasons = grade(a)
+	rate(a)
 	return a, nil
 }
 

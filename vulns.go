@@ -32,15 +32,18 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 	if offered["SSLv2"] {
 		add(Vuln{"DROWN", "HIGH", "CVE-2016-0800", "CWE-310", "SSLv2 is offered; the key may be attacked through it"})
 	}
-	if offered["SSLv3"] {
-		add(Vuln{"POODLE_SSL", "MEDIUM", "CVE-2014-3566", "CWE-310", "SSLv3 is offered; its CBC padding can be attacked"})
+	for _, c := range a.Ciphers {
+		if c.Version == "SSLv3" && has(strings.ToUpper(c.Name), "_CBC_") {
+			add(Vuln{"POODLE_SSL", "MEDIUM", "CVE-2014-3566", "CWE-310", "SSLv3 is offered with CBC ciphers; their padding can be attacked"})
+			break
+		}
 	}
 	var hasRC4, hasExportRSA, hasExportDH, has3DES, hasCBC, hasNULL, hasAnon bool
 	beastAtTLS10 := false
 	for _, c := range a.Ciphers {
 		n := strings.ToUpper(c.Name)
 		hasRC4 = hasRC4 || has(n, "RC4")
-		has3DES = has3DES || c.Bits == 112
+		has3DES = has3DES || block64(n)
 		hasCBC = hasCBC || has(n, "_CBC_")
 		hasNULL = hasNULL || has(n, "NULL")
 		hasAnon = hasAnon || has(n, "_ANON_")
@@ -64,7 +67,7 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 		add(Vuln{"LOGJAM", "MEDIUM", "CVE-2015-4000", "CWE-310", "the DH group is only " + itoa(bits) + " bits"})
 	}
 	if has3DES {
-		add(Vuln{"SWEET32", "LOW", "CVE-2016-2183 CVE-2016-6329", "CWE-327", "a 64-bit-block cipher (3DES) is accepted"})
+		add(Vuln{"SWEET32", "LOW", "CVE-2016-2183 CVE-2016-6329", "CWE-327", "a 64-bit-block cipher (3DES, IDEA, DES, RC2) is accepted"})
 	}
 	if hasRC4 {
 		add(Vuln{"RC4", "MEDIUM", "CVE-2013-2566 CVE-2015-2808", "CWE-310", "the RC4 cipher is accepted"})

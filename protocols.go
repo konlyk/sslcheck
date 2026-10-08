@@ -5,6 +5,7 @@ import (
 	cryptotls "crypto/tls"
 	"encoding/binary"
 	"io"
+	"strings"
 	"time"
 
 	ztls "github.com/zmap/zcrypto/tls"
@@ -55,14 +56,43 @@ func offersVersion(ctx context.Context, addr string, version uint16, opts Option
 		_ = conn.Close()
 		return true
 	default:
-		log, err := legacyHandshake(ctx, addr, version, cipherIDs(), opts)
-		return err == nil && log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version
+		// Offered when the server answers with a ServerHello at that version, whether or not the
+		// rest of the handshake completes.
+		log, _ := legacyHandshake(ctx, addr, version, cipherIDs(), opts)
+		return log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version
 	}
 }
 
 // legacyHandshake opens one connection and offers suites at exactly version, returning what the
 // server answered. A failure (alert, reset, timeout) means the server accepted none of it.
 func legacyHandshake(ctx context.Context, addr string, version uint16, suites []uint16, opts Options) (*ztls.ServerHandshake, error) {
+	return legacyHandshakeWith(ctx, addr, version, suites, opts, nil)
+}
+
+// legacyHandshakeWith is legacyHandshake with the client config adjusted by tweak. A handshake
+// that gets no ServerHello and no TLS alert (a timeout, a reset) is tried up to three times, as a
+// dropped connection is not the server's answer; an alert is.
+func legacyHandshakeWith(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
+	var log *ztls.ServerHandshake
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		log, err = legacyHandshakeOnce(ctx, addr, version, suites, opts, tweak)
+		if (log != nil && log.ServerHello != nil) || err == nil || isTLSAlert(err) || ctx.Err() != nil {
+			break
+		}
+	}
+	return log, err
+}
+
+// isTLSAlert reports whether the server ended the handshake with a TLS alert: a refusal, unlike a
+// network failure.
+func isTLSAlert(err error) bool {
+	msg := err.Error()
+	// zcrypto's alert type is unexported; a server alert surfaces as "remote error: tls: …".
+	return strings.Contains(msg, "remote error") || strings.Contains(msg, "alert")
+}
+
+func legacyHandshakeOnce(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {
 	conn, err := dial(ctx, addr, opts)
 	if err != nil {
 		return nil, err
@@ -73,6 +103,9 @@ func legacyHandshake(ctx context.Context, addr string, version uint16, suites []
 		MinVersion: version, MaxVersion: version,
 		CipherSuites: suites, ForceSuites: true,
 		ServerName: opts.ServerName, InsecureSkipVerify: true,
+	}
+	if tweak != nil {
+		tweak(cfg)
 	}
 	c := ztls.Client(conn, cfg)
 	err = c.Handshake()
@@ -96,6 +129,19 @@ func tls13Dial(ctx context.Context, addr string, opts Options) (*cryptotls.Conn,
 // restrict them, so the scan reads the one it negotiates and trusts that all three are strong:
 // every TLS 1.3 suite is AEAD with an ephemeral key exchange.
 func tls13Ciphers(ctx context.Context, addr string, opts Options) []Cipher {
+	var out []Cipher
+	for _, s := range tls13Suites {
+		if ctx.Err() != nil {
+			break
+		}
+		if tls13Accepts(ctx, addr, s.id, opts) {
+			out = append(out, Cipher{ID: s.id, Name: s.name, Version: "TLS1_3", Strength: StrengthStrong, Bits: keyBits(s.name), Forward: true})
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	// The raw probe found nothing (an unusual server): fall back to the suite crypto/tls gets.
 	conn, err := tls13Dial(ctx, addr, opts)
 	if err != nil {
 		return nil

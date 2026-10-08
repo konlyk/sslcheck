@@ -74,26 +74,33 @@ func classify(name string) Strength {
 	}
 }
 
-// keyBits is the symmetric key size a cipher's name implies, for SWEET32 and the grade.
+// keyBits is the symmetric key size a cipher's name implies, as OpenSSL reports it (Enc=…(bits)),
+// which is what the rating's cipher-strength category uses.
 func keyBits(name string) int {
 	n := strings.ToUpper(name)
 	switch {
 	case has(n, "AES_256"), has(n, "AES256"), has(n, "CAMELLIA_256"), has(n, "CHACHA20"):
 		return 256
-	case has(n, "AES_128"), has(n, "AES128"), has(n, "CAMELLIA_128"), has(n, "SEED"), has(n, "IDEA"):
+	case has(n, "ARIA_256"), has(n, "GOST"):
+		return 256
+	case has(n, "AES_128"), has(n, "AES128"), has(n, "CAMELLIA_128"), has(n, "ARIA_128"), has(n, "SEED"), has(n, "IDEA"):
 		return 128
-	case has(n, "3DES"), has(n, "DES_EDE"):
-		return 112 // 3DES: a 64-bit block, the reason for SWEET32
-	case has(n, "_RC4_"), has(n, "_RC4"):
-		return 128
+	case has(n, "EXPORT1024") && has(n, "RC4_56"), has(n, "EXPORT1024") && has(n, "DES_CBC"):
+		return 56
 	case has(n, "EXPORT"), has(n, "DES40"), has(n, "DES_40"):
 		return 40
+	case has(n, "3DES"), has(n, "DES_EDE"):
+		return 168 // as OpenSSL reports 3DES, which is what the rating's cipher strength uses
+	case has(n, "_RC4_"), has(n, "_RC4"):
+		return 128
+	case has(n, "_RC2_"):
+		return 128
 	case has(n, "_DES_"):
 		return 56
 	case has(n, "NULL"):
 		return 0
 	default:
-		return 0
+		return 128 // an unlisted modern suite; only NULL has no encryption
 	}
 }
 
@@ -135,7 +142,10 @@ func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Op
 				return out
 			}
 			log, err := legacyHandshake(ctx, addr, p.Version, remaining, opts)
-			if err != nil || log == nil || log.ServerHello == nil {
+			// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto
+			// cannot finish, a certificate it cannot parse) still names a suite the server accepts.
+			_ = err
+			if log == nil || log.ServerHello == nil || uint16(log.ServerHello.Version) != p.Version {
 				break
 			}
 			chosen := uint16(log.ServerHello.CipherSuite)

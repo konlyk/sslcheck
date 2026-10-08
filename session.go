@@ -1,0 +1,40 @@
+package sslcheck
+
+import (
+	"context"
+
+	ztls "github.com/zmap/zcrypto/tls"
+)
+
+// scanSessionFeatures checks two properties of the TLS 1.2-and-older handshake: whether the
+// server agrees to TLS compression (CRIME), and whether it supports RFC 5746 secure
+// renegotiation. Both are tested at the best protocol below TLS 1.3 the host offers; a host that
+// speaks only TLS 1.3 has neither, and renegotiation is reported as not applicable (nil).
+func scanSessionFeatures(ctx context.Context, addr string, protocols []Protocol, opts Options) (compression bool, secureReneg *bool) {
+	var version uint16
+	for _, p := range protocols {
+		if p.Offered && p.Version != versionTLS13 && p.Version != versionSSL20 && p.Version > version {
+			version = p.Version
+		}
+	}
+	if version == 0 {
+		return false, nil
+	}
+	if log, err := legacyHandshake(ctx, addr, version, cipherIDs(), opts); err == nil && log != nil && log.ServerHello != nil {
+		v := log.ServerHello.SecureRenegotiation
+		secureReneg = &v
+	}
+	// Offer DEFLATE first: a server that compresses picks it.
+	log, err := legacyHandshakeWith(ctx, addr, version, cipherIDs(), opts, func(c *ztls.Config) {
+		c.CompressionMethods = []uint8{compressionDeflate, compressionNone}
+	})
+	if err == nil && log != nil && log.ServerHello != nil {
+		compression = uint8(log.ServerHello.CompressionMethod) == compressionDeflate
+	}
+	return compression, secureReneg
+}
+
+const (
+	compressionNone    = 0
+	compressionDeflate = 1
+)
