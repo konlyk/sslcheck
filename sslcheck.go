@@ -3,8 +3,8 @@
 // offers, its certificate chain, the known weaknesses it has, and an SSL Labs grade derived from
 // all of it. Nothing is shelled out; every check is a connection this package makes and reads.
 //
-// Only what Ceeyu uses is ported. testssl's text/CSV/HTML reporters, mass-testing, STARTTLS for
-// mail, client simulation and server banners are left out; the scanning checks are kept.
+// It ports testssl's scanning checks only; its text/CSV/HTML reporters, mass-testing, STARTTLS for
+// mail, client simulation and server banners are left out.
 package sslcheck
 
 import (
