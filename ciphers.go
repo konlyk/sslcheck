@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	ztls "github.com/zmap/zcrypto/tls"
 )
@@ -126,7 +127,9 @@ func has(s, sub string) bool { return strings.Contains(s, sub) }
 
 // scanCiphers finds the ciphers the host accepts at each offered protocol, best protocol first.
 // The protocols are enumerated concurrently, since each is an independent sequence of handshakes.
-func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Options) []Cipher {
+// The second value names the protocols whose enumeration ended on a network failure rather than
+// the server's refusal, so their lists may be short.
+func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Options) ([]Cipher, []string) {
 	var offered []Protocol
 	for _, p := range protocols {
 		if p.Offered {
@@ -136,41 +139,62 @@ func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Op
 	// Best protocol first, as the Ciphers field is documented.
 	sort.Slice(offered, func(i, j int) bool { return offered[i].Version > offered[j].Version })
 	perProto := make([][]Cipher, len(offered))
+	complete := make([]bool, len(offered))
 	var wg sync.WaitGroup
 	for i, p := range offered {
 		wg.Add(1)
 		go func(i int, p Protocol) {
 			defer wg.Done()
-			perProto[i] = ciphersAt(ctx, addr, p, opts)
+			perProto[i], complete[i] = ciphersAt(ctx, addr, p, opts)
 		}(i, p)
 	}
 	wg.Wait()
 	var out []Cipher
-	for _, cs := range perProto {
+	var incomplete []string
+	for i, cs := range perProto {
 		out = append(out, cs...)
+		if !complete[i] {
+			incomplete = append(incomplete, "ciphers "+offered[i].Name)
+		}
 	}
-	return out
+	return out, incomplete
 }
 
+// enumerationRetries is how many times a cipher enumeration retries an offer the network dropped
+// (each retry waiting longer) before it gives the list up as incomplete.
+const enumerationRetries = 3
+
 // ciphersAt enumerates the ciphers one protocol accepts, the way testssl does: offer every suite,
-// note the one the server picks, drop it, and offer the rest, until the server accepts none.
-func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) []Cipher {
+// note the one the server picks, drop it, and offer the rest, until the server accepts none. The
+// server says so with an alert (or, on some servers, by closing); a timeout or a reset is the
+// network failing under the probe, so the same offer is retried a few times, with backoff, and
+// complete is false if it never got an answer.
+func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) (ciphers []Cipher, complete bool) {
 	if p.Version == versionTLS13 { // TLS 1.3: its suites are fixed and all strong
-		return tls13Ciphers(ctx, addr, opts)
+		return tls13Ciphers(ctx, addr, opts), true
 	}
 	var out []Cipher
 	seen := map[uint16]bool{}
 	remaining := cipherIDs()
+	retries := 0
 	for len(remaining) > 0 {
 		if ctx.Err() != nil {
-			return out
+			return out, false
 		}
-		log, _ := legacyHandshake(ctx, addr, p.Version, remaining, opts)
+		log, err := legacyHandshake(ctx, addr, p.Version, remaining, opts)
 		// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto cannot
 		// finish, a certificate it cannot parse) still names a suite the server accepts.
 		if log == nil || log.ServerHello == nil || uint16(log.ServerHello.Version) != p.Version {
-			break
+			if err != nil && isTransportFailure(err) {
+				if retries < enumerationRetries && sleepCtx(ctx, time.Duration(retries+1)*retryBackoff) {
+					retries++
+					continue
+				}
+				return out, false
+			}
+			break // the server's refusal: nothing more is accepted
 		}
+		retries = 0
 		chosen := uint16(log.ServerHello.CipherSuite)
 		info, ok := cipherByID(chosen)
 		if !ok || seen[chosen] { // an unknown or already-seen pick means the server stopped cooperating
@@ -180,7 +204,7 @@ func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) []Cip
 		out = append(out, Cipher{ID: chosen, Name: info.name, Version: p.Name, Strength: info.strength, Bits: info.bits, Forward: info.forward})
 		remaining = remove(remaining, chosen)
 	}
-	return out
+	return out, true
 }
 
 func remove(ids []uint16, id uint16) []uint16 {

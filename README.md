@@ -99,8 +99,13 @@ type Assessment struct {
 	CipherStrengthScore int      // category 3, cipher strength
 	Reasons             []string // the grade caps that were applied
 	Warnings            []string // what keeps an A from an A+ (it is then A-)
+	Incomplete          []string // checks that ended on a network failure after retries ("protocol TLS1", "ciphers TLS1_2", "http")
 }
 ```
+
+A dropped connection is retried with backoff, and a probe that still gets no answer is listed in
+`Incomplete` rather than read as "not offered"; the fields it feeds, and so the grade, may then be
+understated, and a caller that needs certainty can rescan when the list is not empty.
 
 `Protocol` carries `Name` (`"SSLv2"`, `"SSLv3"`, `"TLS1"`, `"TLS1_1"`, `"TLS1_2"`, `"TLS1_3"`),
 `Offered` and `Deprecated`. `Cipher` carries the IANA `Name`, the `Version` it was accepted at, a

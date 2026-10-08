@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ztls "github.com/zmap/zcrypto/tls"
@@ -35,9 +36,12 @@ var allVersions = []struct {
 }
 
 // scanProtocols tests each version and reports which the host offers. The versions are
-// independent handshakes, so they run concurrently; the result keeps them oldest-first.
-func scanProtocols(ctx context.Context, addr string, opts Options) []Protocol {
+// independent handshakes, so they run concurrently; the result keeps them oldest-first. The
+// second value names the versions whose probe ended on a network failure rather than the
+// server's answer, so "not offered" there is not certain.
+func scanProtocols(ctx context.Context, addr string, opts Options) ([]Protocol, []string) {
 	out := make([]Protocol, len(allVersions))
+	undecided := make([]bool, len(allVersions))
 	var wg sync.WaitGroup
 	for i, v := range allVersions {
 		out[i] = Protocol{Version: v.version, Name: v.name, Deprecated: v.deprecated}
@@ -47,31 +51,41 @@ func scanProtocols(ctx context.Context, addr string, opts Options) []Protocol {
 		wg.Add(1)
 		go func(i int, version uint16) {
 			defer wg.Done()
-			out[i].Offered = offersVersion(ctx, addr, version, opts)
+			out[i].Offered, undecided[i] = offersVersion(ctx, addr, version, opts)
 		}(i, v.version)
 	}
 	wg.Wait()
-	return out
+	var incomplete []string
+	for i, u := range undecided {
+		if u {
+			incomplete = append(incomplete, "protocol "+out[i].Name)
+		}
+	}
+	return out, incomplete
 }
 
-// offersVersion reports whether the host completes a handshake at exactly this version.
-func offersVersion(ctx context.Context, addr string, version uint16, opts Options) bool {
+// offersVersion reports whether the host completes a handshake at exactly this version. undecided
+// is true when the probe ended on a network failure (a timeout, a reset) rather than an answer.
+func offersVersion(ctx context.Context, addr string, version uint16, opts Options) (offered, undecided bool) {
 	switch version {
 	case versionSSL20:
-		return offersSSL2(ctx, addr, opts)
+		return offersSSL2(ctx, addr, opts), false
 	case versionTLS13:
 		conn, err := tls13Dial(ctx, addr, opts)
 		if err != nil {
-			return false
+			return false, isTransportFailure(err)
 		}
 		_ = conn.Close()
-		return true
+		return true, false
 	default:
 		// Offered when the server answers with a ServerHello at that version, whether or not the
 		// rest of the handshake completes. A missed protocol changes the grade, so this probe is
 		// given the full three attempts even when the failures are timeouts.
-		log, _ := handshakeAttempts(ctx, addr, version, cipherIDs(), opts, nil, 3)
-		return log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version
+		log, err := handshakeAttempts(ctx, addr, version, cipherIDs(), opts, nil, 3)
+		if log != nil && log.ServerHello != nil && uint16(log.ServerHello.Version) == version {
+			return true, false
+		}
+		return false, err != nil && isTransportFailure(err)
 	}
 }
 
@@ -91,12 +105,17 @@ func legacyHandshakeWith(ctx context.Context, addr string, version uint16, suite
 }
 
 // handshakeAttempts makes up to three handshake attempts, stopping at the first that yields a
-// ServerHello or a TLS alert, and after maxTimeouts of them have timed out.
+// ServerHello or a TLS alert, and after maxTimeouts of them have timed out. A retry waits a
+// little first: a dropped connection usually means the host is shedding a burst, and an immediate
+// retry lands in the same burst.
 func handshakeAttempts(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config), maxTimeouts int) (*ztls.ServerHandshake, error) {
 	var log *ztls.ServerHandshake
 	var err error
 	timeouts := 0
 	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && !sleepCtx(ctx, time.Duration(attempt)*retryBackoff) {
+			break
+		}
 		log, err = legacyHandshakeOnce(ctx, addr, version, suites, opts, tweak)
 		if (log != nil && log.ServerHello != nil) || err == nil || isTLSAlert(err) || ctx.Err() != nil {
 			break
@@ -111,6 +130,22 @@ func handshakeAttempts(ctx context.Context, addr string, version uint16, suites 
 	return log, err
 }
 
+// retryBackoff is the wait before the first retry of a dropped connection; later retries wait
+// multiples of it.
+const retryBackoff = 250 * time.Millisecond
+
+// sleepCtx waits d, or until ctx is done, and reports whether the wait ran its course.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // isTLSAlert reports whether the server ended the handshake with a TLS alert: a refusal, unlike a
 // network failure.
 func isTLSAlert(err error) bool {
@@ -123,6 +158,20 @@ func isTLSAlert(err error) bool {
 func isTimeout(err error) bool {
 	var ne net.Error
 	return (errors.As(err, &ne) && ne.Timeout()) || strings.Contains(err.Error(), "i/o timeout")
+}
+
+// isTransportFailure reports whether err is the network failing under the probe (a timeout, a
+// reset, a broken pipe) rather than the server answering, which it does with an alert or, on some
+// servers, a plain close.
+func isTransportFailure(err error) bool {
+	if err == nil || isTLSAlert(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	if isTimeout(err) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection refused")
 }
 
 func legacyHandshakeOnce(ctx context.Context, addr string, version uint16, suites []uint16, opts Options, tweak func(*ztls.Config)) (*ztls.ServerHandshake, error) {

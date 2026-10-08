@@ -40,6 +40,13 @@ type Assessment struct {
 	CipherStrengthScore int      // category 3, cipher strength
 	Reasons             []string // the caps applied, worst first
 	Warnings            []string // what keeps an A from an A+ (it is then an A-)
+
+	// Incomplete names the checks that ended on a network failure (a timed-out or reset probe)
+	// rather than on the server's answer, even after retries: "protocol TLS1", "ciphers TLS1_2",
+	// "http". The fields they feed may then be understated, and so may the grade. It is empty for
+	// a scan that got an answer to everything; a caller that needs certainty can rescan when it
+	// is not.
+	Incomplete []string
 }
 
 // Protocol is one SSL/TLS version and whether the host offers it.
@@ -134,11 +141,13 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	}
 	opts.limiter = make(chan struct{}, opts.maxConnections())
 	a := &Assessment{}
-	a.Protocols = scanProtocols(ctx, addr, opts)
+	a.Protocols, a.Incomplete = scanProtocols(ctx, addr, opts)
 	if !anyOffered(a.Protocols) {
 		return a, nil // nothing speaks TLS here; the caller treats an empty assessment as "no TLS"
 	}
-	a.Ciphers = scanCiphers(ctx, addr, a.Protocols, opts)
+	var incomplete []string
+	a.Ciphers, incomplete = scanCiphers(ctx, addr, a.Protocols, opts)
+	a.Incomplete = append(a.Incomplete, incomplete...)
 	a.ForwardSecret = forwardSecret(a.Ciphers)
 	// The remaining checks read only the protocols and ciphers just found, each opens its own
 	// connections, and each writes its own field, so they run concurrently.
@@ -155,6 +164,9 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		go func() { defer wg.Done(); a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts) }()
 	}
 	wg.Wait()
+	if !opts.SkipHTTP && a.HTTP == nil {
+		a.Incomplete = append(a.Incomplete, "http") // or the service is not HTTP; the caller knows which
+	}
 	rate(a)
 	return a, nil
 }
