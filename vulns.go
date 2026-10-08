@@ -64,8 +64,9 @@ func scanVulns(ctx context.Context, host, addr string, a *Assessment, opts Optio
 	}
 	if hasExportDH {
 		add(Vuln{"LOGJAM", "MEDIUM", "CVE-2015-4000", "CWE-310", "an export-grade DH cipher is accepted"})
-	} else if bits := dhPrimeBits(ctx, addr, opts); bits > 0 && bits < 1024 {
-		add(Vuln{"LOGJAM", "MEDIUM", "CVE-2015-4000", "CWE-310", "the DH group is only " + itoa(bits) + " bits"})
+	} else if bits := dhPrimeBits(ctx, addr, bestLegacyVersion(a.Protocols), opts); bits > 0 && bits <= 1024 {
+		// testssl reports any group of 1024 bits or less, graded by size.
+		add(Vuln{"LOGJAM", dhSeverity(bits), "CVE-2015-4000", "CWE-310", "the DH group is only " + itoa(bits) + " bits"})
 	}
 	if has3DES {
 		add(Vuln{"SWEET32", "LOW", "CVE-2016-2183 CVE-2016-6329", "CWE-327", "a 64-bit-block cipher (3DES, IDEA, DES, RC2) is accepted"})
@@ -150,23 +151,51 @@ func legacyCipherIDs(cs []Cipher) []uint16 {
 	return out
 }
 
-// dhPrimeBits is the size of the DH group the host uses, or 0 when it negotiates no DHE cipher.
-// It handshakes offering only DHE ciphers and reads the server's DH parameters.
-func dhPrimeBits(ctx context.Context, addr string, opts Options) int {
+// dhPrimeBits is the size of the DH group the host uses at version, or 0 when it negotiates no
+// DHE cipher. It handshakes offering only DHE ciphers and reads the server's DH parameters. The
+// server picks its preferred DHE suite, and when that is one zcrypto cannot complete (DHE_DSS,
+// Camellia, ARIA, PSK …) zcrypto stops before the ServerKeyExchange; so, as the cipher scan does,
+// drop the pick and ask again until a suite yields the parameters or none is left.
+func dhPrimeBits(ctx context.Context, addr string, version uint16, opts Options) int {
 	var dheSuites []uint16
 	for _, c := range knownCiphers {
 		if has(strings.ToUpper(c.name), "DHE_") && !has(strings.ToUpper(c.name), "ECDHE") {
 			dheSuites = append(dheSuites, c.id)
 		}
 	}
-	if len(dheSuites) == 0 {
+	if version == 0 {
 		return 0
 	}
-	log, err := legacyHandshake(ctx, addr, ztls.VersionTLS12, dheSuites, opts)
-	if err != nil || log == nil || log.ServerKeyExchange == nil || log.ServerKeyExchange.DHParams == nil || log.ServerKeyExchange.DHParams.Prime == nil {
-		return 0
+	for len(dheSuites) > 0 {
+		if ctx.Err() != nil {
+			return 0
+		}
+		log, _ := legacyHandshake(ctx, addr, version, dheSuites, opts)
+		if log == nil || log.ServerHello == nil {
+			return 0
+		}
+		if ske := log.ServerKeyExchange; ske != nil && ske.DHParams != nil && ske.DHParams.Prime != nil {
+			return ske.DHParams.Prime.BitLen()
+		}
+		before := len(dheSuites)
+		dheSuites = remove(dheSuites, uint16(log.ServerHello.CipherSuite))
+		if len(dheSuites) == before {
+			return 0 // the server picked something it was not offered: stop guessing
+		}
 	}
-	return log.ServerKeyExchange.DHParams.Prime.BitLen()
+	return 0
+}
+
+// dhSeverity grades a DH group of 1024 bits or less as testssl's pr_dh_quality does.
+func dhSeverity(bits int) string {
+	switch {
+	case bits <= 600:
+		return "CRITICAL"
+	case bits <= 800:
+		return "HIGH"
+	default:
+		return "MEDIUM"
+	}
 }
 
 func itoa(n int) string {

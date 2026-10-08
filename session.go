@@ -11,12 +11,7 @@ import (
 // renegotiation. Both are tested at the best protocol below TLS 1.3 the host offers; a host that
 // speaks only TLS 1.3 has neither, and renegotiation is reported as not applicable (nil).
 func scanSessionFeatures(ctx context.Context, addr string, protocols []Protocol, opts Options) (compression bool, secureReneg *bool) {
-	var version uint16
-	for _, p := range protocols {
-		if p.Offered && p.Version != versionTLS13 && p.Version != versionSSL20 && p.Version > version {
-			version = p.Version
-		}
-	}
+	version := bestLegacyVersion(protocols)
 	if version == 0 {
 		return false, nil
 	}
@@ -41,3 +36,15 @@ const (
 	compressionNone    = 0
 	compressionDeflate = 1
 )
+
+// bestLegacyVersion is the best protocol offered that zcrypto speaks (SSLv3 to TLS 1.2), or 0 when
+// there is none.
+func bestLegacyVersion(protocols []Protocol) uint16 {
+	var version uint16
+	for _, p := range protocols {
+		if p.Offered && p.Version != versionTLS13 && p.Version != versionSSL20 && p.Version > version {
+			version = p.Version
+		}
+	}
+	return version
+}
