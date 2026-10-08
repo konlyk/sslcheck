@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/x509"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -124,12 +125,21 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	}
 	a.Ciphers = scanCiphers(ctx, addr, a.Protocols, opts)
 	a.ForwardSecret = forwardSecret(a.Ciphers)
-	a.Certificates = scanCertificates(ctx, host, addr, opts)
-	a.Compression, a.SecureRenegotiation = scanSessionFeatures(ctx, addr, a.Protocols, opts)
+	// The remaining checks read only the protocols and ciphers just found, each opens its own
+	// connections, and each writes its own field, so they run concurrently.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); a.Certificates = scanCertificates(ctx, host, addr, opts) }()
+	go func() {
+		defer wg.Done()
+		a.Compression, a.SecureRenegotiation = scanSessionFeatures(ctx, addr, a.Protocols, opts)
+	}()
+	go func() { defer wg.Done(); a.Vulns = scanVulns(ctx, addr, a, opts) }()
 	if !opts.SkipHTTP {
-		a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts)
+		wg.Add(1)
+		go func() { defer wg.Done(); a.HTTP = fetchHTTPHeaders(ctx, host, addr, opts) }()
 	}
-	a.Vulns = scanVulns(ctx, addr, a, opts)
+	wg.Wait()
 	rate(a)
 	return a, nil
 }
