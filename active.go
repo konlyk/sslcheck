@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	cryptotls "crypto/tls"
 	"math/big"
+	"sync"
 	"time"
 )
 
@@ -224,21 +225,28 @@ func robot(ctx context.Context, addr string, opts Options) string {
 	return "the server's answers to malformed RSA key exchanges differ by padding validity"
 }
 
-// robotBattery sends the five probes once and returns how the server answered each. ok is false
-// when a probe could not be delivered (a dial or write failure), which makes the whole run
-// inconclusive rather than a signal.
+// robotBattery sends the five probes once and returns how the server answered each. The probes
+// are independent connections, so they are sent concurrently; each waits up to robotReadTimeout
+// for its answer, and running them together turns five such waits into one. ok is false when a
+// probe could not be delivered (a dial or write failure), which makes the whole run inconclusive
+// rather than a signal.
 func robotBattery(ctx context.Context, addr string, opts Options, pub *rsa.PublicKey, size int, version uint16) ([]string, bool) {
 	probes := robotProbes(size, version)
-	resp := make([]string, 0, len(probes))
-	for _, p := range probes {
-		if ctx.Err() != nil {
-			return nil, false
-		}
-		r, ok := robotResponse(ctx, addr, opts, pub, p)
+	resp := make([]string, len(probes))
+	oks := make([]bool, len(probes))
+	var wg sync.WaitGroup
+	for i, p := range probes {
+		wg.Add(1)
+		go func(i int, p []byte) {
+			defer wg.Done()
+			resp[i], oks[i] = robotResponse(ctx, addr, opts, pub, p)
+		}(i, p)
+	}
+	wg.Wait()
+	for _, ok := range oks {
 		if !ok {
 			return nil, false
 		}
-		resp = append(resp, r)
 	}
 	return resp, true
 }

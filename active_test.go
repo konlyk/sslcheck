@@ -3,7 +3,9 @@ package sslcheck
 import (
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
 	cryptotls "crypto/tls"
+	"math/big"
 	"net"
 	"testing"
 
@@ -63,22 +65,22 @@ func TestCCSInjection(t *testing.T) {
 }
 
 // A server whose alert to the well-formed padding differs, reproducibly, from its alert to the
-// malformed probes is a padding oracle; one that answers every probe alike is not.
+// malformed probes is a padding oracle; one that answers every probe alike is not. The scripted
+// oracle decrypts each probe with the test key to tell the well-formed one apart, so it does not
+// depend on the order the probes' connections arrive in (they are sent concurrently).
 func TestRobot(t *testing.T) {
-	cert, _, _ := testCert(t)
-	// robot() opens 1 key-fetch connection, then two batteries of 5 probes each (connections
-	// 2-6 and 7-11). Probe 0 of each battery is the well-formed one.
+	cert, _, key := testCert(t)
 	robotServer := func(oracle bool) string {
-		return scriptedServer(t, func(i int, c net.Conn) {
+		return scriptedServer(t, func(_ int, c net.Conn) {
 			if !rsaKexHandshake(c, cert.Certificate[0]) {
 				return
 			}
-			if i == 1 {
-				return // the key-fetch connection reads only up to ServerHelloDone
+			typ, body, err := srvRead(c) // the ClientKeyExchange (absent on the key-fetch connection)
+			if err != nil || typ != recHandshake || len(body) < 4 || body[0] != 16 {
+				return
 			}
-			drainRecords(c, 3) // ClientKeyExchange, ChangeCipherSpec, the dummy Finished
-			pos := (i - 2) % 5
-			if oracle && pos == 0 {
+			drainRecords(c, 2) // ChangeCipherSpec, the dummy Finished
+			if oracle && wellFormedPremaster(key, body[4:]) {
 				srvAlert(c, 20) // the well-formed probe is treated differently
 			} else {
 				srvAlert(c, 40)
@@ -87,6 +89,32 @@ func TestRobot(t *testing.T) {
 	}
 	require.NotEmpty(t, robot(context.Background(), robotServer(true), testOpts()), "an oracle")
 	require.Empty(t, robot(context.Background(), robotServer(false), testOpts()), "uniform answers")
+}
+
+// wellFormedPremaster raw-decrypts a ClientKeyExchange body (2-byte length + ciphertext) with the
+// test key and reports whether it carries correct PKCS#1 v1.5 padding: 00 02, non-zero padding,
+// a 00 delimiter 48 bytes from the end.
+func wellFormedPremaster(key *rsa.PrivateKey, cke []byte) bool {
+	if len(cke) < 2 {
+		return false
+	}
+	n := int(cke[0])<<8 | int(cke[1])
+	if len(cke) < 2+n {
+		return false
+	}
+	m := new(big.Int).Exp(new(big.Int).SetBytes(cke[2:2+n]), key.D, key.N)
+	b := make([]byte, key.Size())
+	m.FillBytes(b)
+	size := len(b)
+	if b[0] != 0x00 || b[1] != 0x02 || b[size-49] != 0x00 {
+		return false
+	}
+	for _, x := range b[2 : size-49] {
+		if x == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // A server with no RSA key exchange cannot be a ROBOT oracle.
