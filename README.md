@@ -90,7 +90,14 @@ type Assessment struct {
 
 	Compression         bool         // the server agreed to TLS compression (CRIME)
 	SecureRenegotiation *bool        // RFC 5746 secure renegotiation; nil when only TLS 1.3 is offered
-	HTTP                *HTTPHeaders // what the HTTP answer says about TLS (HSTS, HPKP); nil when not fetched
+	HTTP                *HTTPHeaders // what the HTTP answer says about TLS (HSTS, HPKP, compression); nil when not fetched
+	CipherOrder         *bool        // the server imposes its own cipher order; nil when nothing to compare
+	NegotiatedCurve     string       // the ECDHE curve the server chose; "" when no ECDHE suite
+	ALPN                []string     // the application protocols the server selects ("h2", "http/1.1")
+	SessionTicket       bool         // the server issues an RFC 5077 session ticket
+	FallbackSCSV        *bool        // the server honours TLS_FALLBACK_SCSV; nil when nothing to fall back from
+	DHBits              int          // the ephemeral DH group size, when one is negotiated
+	DHGroup             string       // a well-known DH group's name, "" for a server-unique prime
 
 	Grade               string   // A+ … F, or M (name mismatch) / T (untrusted)
 	Score               int      // 0–100; 0 when the grade is F, T or M
@@ -111,11 +118,13 @@ understated, and a caller that needs certainty can rescan when the list is not e
 `Offered` and `Deprecated`. `Cipher` carries the IANA `Name`, the `Version` it was accepted at, a
 `Strength` (`StrengthStrong` / `StrengthWeak` / `StrengthInsecure`), `Bits` and `Forward`.
 `Certificate` carries `CommonName`, `AltNames`, `Issuer`, `Trusted`, `NameMismatch`, `TrustReason`,
-`ChainComplete`, `ChainIncomplete`, `ChainError`, `SelfSigned`, `FingerprintSHA256`, `KeyType`,
-`KeyAlg`, `KeyBits`, `RSAExponent`, `SignatureAlg`, `SignatureHash`, `Expires` and an `Expired()`
-method, `OCSPStapled`, `Revoked`, `RevocationSource`, and the parsed `Leaf`/`Chain`
-(`*crypto/x509.Certificate`, excluded from the JSON). `Vuln` carries `Name`, `Severity`
-(`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`), `CVE`, `CWE` and a `Remark`.
+`ChainComplete`, `ChainIncomplete`, `ChainError`, `SelfSigned`, `FingerprintSHA256`,
+`FingerprintSHA1`, `Serial`, `KeyType`, `KeyAlg`, `KeyBits`, `RSAExponent`, `SignatureAlg`,
+`SignatureHash`, `NotBefore`, `Expires`, `ValidityDays` and an `Expired()` method, `OCSPStapled`,
+`MustStaple`, `Transparency`, `ChainOrderProblem`, `WeakChainSig`, `IntermediateExpiry`, `Revoked`,
+`RevocationSource`, and the parsed `Leaf`/`Chain` (`*crypto/x509.Certificate`, excluded from the
+JSON). `HTTPHeaders` carries `Status`, `HSTS`, `HPKP`, `HPKPReportOnly` and `Compression`. `Vuln`
+carries `Name`, `Severity` (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`), `CVE`, `CWE` and a `Remark`.
 
 ## What it checks
 
@@ -124,12 +133,21 @@ method, `OCSPStapled`, `Revoked`, `RevocationSource`, and the parsed `Leaf`/`Cha
   insecure, with its key size and whether its key exchange is forward-secret.
 - **Certificate**: one per certificate type the host serves (an RSA and an ECDSA certificate are
   described separately), each with its common name, SANs, issuer, key algorithm and size, signature
-  algorithm and hash, SHA-256 fingerprint, expiry, chain completeness, OCSP stapling and revocation,
-  and whether it is trusted and valid for the hostname. A failed chain is classified the way testssl
-  reads OpenSSL's verify result, so a missing intermediate is reported as an incomplete chain rather
-  than depending on the platform verifier fetching it.
-- **Session features**: TLS compression (CRIME) and RFC 5746 secure renegotiation.
-- **HTTP**: the HSTS and HPKP headers of the host's answer to `GET /` (skip with `Options.SkipHTTP`).
+  algorithm and hash, SHA-256 and SHA-1 fingerprints, serial, validity window and length, chain
+  completeness and ordering, OCSP stapling, must-staple, Certificate Transparency, a weak
+  intermediate signature, the soonest intermediate expiry, revocation, and whether it is trusted and
+  valid for the hostname. A failed chain is classified the way testssl reads OpenSSL's verify
+  result, so a missing intermediate is an incomplete chain rather than depending on the platform
+  verifier fetching it. A validity over 398 days (post-2020), five years or ten years, an
+  intermediate expiring soon, a SHA1/MD5-signed intermediate and an out-of-order chain are findings.
+- **Cipher order**: whether the server imposes its own order or lets the client choose (a finding,
+  graded by how much weaker the client's pick can be).
+- **Key exchange**: the negotiated ECDHE curve, and the DH group size and name (a well-known prime
+  is a Logjam finding at any size).
+- **Session features**: TLS compression (CRIME), RFC 5746 secure renegotiation, session tickets,
+  ALPN, and TLS_FALLBACK_SCSV downgrade protection.
+- **HTTP**: the HSTS and HPKP headers of the host's answer to `GET /`, and response compression
+  (BREACH); skip with `Options.SkipHTTP`.
 - **Grade**: the SSL Labs letter and score as testssl's `run_rating` computes them — three category
   scores (protocol support, key exchange, cipher strength) weighted 30/30/40, every `set_grade_cap`
   and `set_grade_warning` rule, and A+/A- awarded from the warning set.
@@ -139,8 +157,10 @@ method, `OCSPStapled`, `Revoked`, `RevocationSource`, and the parsed `Leaf`/`Cha
   error, a timeout or an answer it does not recognise is reported as *not* vulnerable, so the
   scan never raises a false alarm. The probes are detection only; they do not run the attacks.
 
-Deliberately out of scope (testssl features with no bearing on the assessment): text/CSV/HTML
-reports, mass testing, STARTTLS for mail servers, and browser simulations.
+Out of scope: text/CSV/HTML reports, mass testing, STARTTLS for mail servers, and browser
+simulations (as testssl has them); and three checks that need machinery out of proportion to their
+value here — client-initiated renegotiation (a DoS signal; needs a full handshake continued on the
+encrypted channel), GREASE tolerance, and DNS CAA.
 
 ## CLI
 
