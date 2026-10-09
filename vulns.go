@@ -66,16 +66,14 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 		add(Vuln{"LOGJAM", "MEDIUM", "CVE-2015-4000", "CWE-310", "an export-grade DH cipher is accepted"})
 	} else if bits, group := dhParams(ctx, addr, bestLegacyVersion(a.Protocols), opts); bits > 0 {
 		a.DHBits, a.DHGroup = bits, group
-		remark := "the DH group is only " + itoa(bits) + " bits"
+		// testssl grades a well-known prime (one an attacker may have precomputed for) harsher
+		// than an unknown one of the same size, and an unknown one only at 1024 bits or less.
 		if group != "" {
-			remark = "the server uses a well-known " + itoa(bits) + "-bit DH group (" + group + "), which an attacker may have precomputed for"
-		}
-		// testssl reports any group of 1024 bits or less, graded by size; a well-known group is a
-		// concern at any size, reported at least LOW.
-		if bits <= 1024 {
-			add(Vuln{"LOGJAM", dhSeverity(bits), "CVE-2015-4000", "CWE-310", remark})
-		} else if group != "" {
-			add(Vuln{"LOGJAM", "LOW", "CVE-2015-4000", "CWE-310", remark})
+			if sev := knownPrimeSeverity(bits); sev != "" {
+				add(Vuln{"LOGJAM", sev, "CVE-2015-4000", "CWE-310", "the server uses a well-known " + itoa(bits) + "-bit DH group (" + group + "), which an attacker may have precomputed for"})
+			}
+		} else if bits <= 1024 {
+			add(Vuln{"LOGJAM", dhSeverity(bits), "CVE-2015-4000", "CWE-310", "the DH group is only " + itoa(bits) + " bits"})
 		}
 	}
 	if has3DES {
@@ -177,6 +175,22 @@ func legacyCipherIDs(cs []Cipher) []uint16 {
 		}
 	}
 	return out
+}
+
+// knownPrimeSeverity grades a well-known DH prime as testssl's out_common_prime does: a published
+// group is worth precomputing for, so it is held to a stricter ladder than an unknown one, and is
+// no concern at all above 1536 bits (RFC 7919's groups are recommended practice).
+func knownPrimeSeverity(bits int) string {
+	switch {
+	case bits <= 800:
+		return "CRITICAL"
+	case bits <= 1024:
+		return "HIGH"
+	case bits <= 1536:
+		return "LOW"
+	default:
+		return ""
+	}
 }
 
 // dhSeverity grades a DH group of 1024 bits or less as testssl's pr_dh_quality does.

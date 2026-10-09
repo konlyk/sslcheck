@@ -64,3 +64,12 @@ func TestScanConnectionSeesSessionTicket(t *testing.T) {
 	_, _, ticket = scanConnection(context.Background(), addr2, protos, Options{Timeout: 3 * time.Second, ServerName: "localhost"})
 	require.False(t, ticket)
 }
+
+// Well-known primes follow testssl's out_common_prime ladder; RFC-sized groups are no finding.
+func TestKnownPrimeSeverity(t *testing.T) {
+	require.Equal(t, "CRITICAL", knownPrimeSeverity(768))
+	require.Equal(t, "HIGH", knownPrimeSeverity(1024))
+	require.Equal(t, "LOW", knownPrimeSeverity(1536))
+	require.Equal(t, "", knownPrimeSeverity(2048))
+	require.Equal(t, "", knownPrimeSeverity(4096))
+}

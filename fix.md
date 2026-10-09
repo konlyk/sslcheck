@@ -12,18 +12,18 @@ Status: `[ ]` open, `[x]` fixed (commit noted).
   only when `ForceSessionTicketExt` is set or a session cache is configured; `scanConnection` sets
   neither, so no server answers with it. All 30 hosts report `false`.
   Fix: set `ForceSessionTicketExt` on that handshake.
-- [ ] **2. Cipher order lacks testssl's ChaCha exception.** BoringSSL-style servers (Cloudflare,
+- [x] **2. Cipher order lacks testssl's ChaCha exception.** BoringSSL-style servers (Cloudflare,
   Google) keep a server order but honour the client's ChaCha20 preference within an
   equal-preference group; testssl reports that as "server order, prioritises ChaCha when preferred
   by clients" (OK). We see the reversed pick land on ChaCha, call it "no order", and raise
   `NO_CIPHER_ORDER` on cloudflare.com, example.com and www.google.com.
   Fix: when the two picks differ and the reversed pick is a ChaCha suite, compare again with the
   ChaCha suites removed; if that is consistent, it is an order.
-- [ ] **3. Fallback SCSV reports any non-answer as "not honoured".** Everything that is not an
+- [x] **3. Fallback SCSV reports any non-answer as "not honoured".** Everything that is not an
   inappropriate_fallback alert, including a timeout, a reset or an unrelated alert, is read as the
   server failing the check; rsa4096 and rsa8192 got a false `FALLBACK_SCSV/LOW`.
   Fix: only a ServerHello proves it is not honoured; anything else leaves the result `nil`.
-- [ ] **4. Well-known-DH-group severity is wrong both ways.** testssl's `out_common_prime` grades a
+- [x] **4. Well-known-DH-group severity is wrong both ways.** testssl's `out_common_prime` grades a
   known prime harsher than an unknown one at or under 1024 bits (HIGH; CRITICAL at or under 800),
   LOW for 1025–1536, informational above that and for RFC 7919 groups. We emit MEDIUM for the known
   1024-bit nginx prime and would emit LOW for RFC 3526 group 14 / ffdhe2048, which is good practice.
