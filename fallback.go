@@ -31,15 +31,21 @@ func scanFallbackSCSV(ctx context.Context, addr string, protocols []Protocol, op
 	if err := r.writeRecord(recHandshake, 0x0301, fallbackHello(opts.ServerName, fallback, suites)); err != nil {
 		return nil
 	}
-	_, _, err = r.readRecord()
-	a, ok := asAlert(err)
+	typ, body, err := r.readRecord()
 	yes, no := true, false
-	if ok && a.code == 86 { // inappropriate_fallback: the server refused the downgrade
-		return &yes
+	if a, ok := asAlert(err); ok {
+		if a.code == 86 { // inappropriate_fallback: the server refused the downgrade
+			return &yes
+		}
+		return nil // refused for some other reason: says nothing about the SCSV
 	}
-	// A ServerHello (handshake records read without an alert), or any other alert, means the
-	// server did not refuse the fallback: the protection is absent.
-	return &no
+	if err != nil {
+		return nil // a dropped connection is not an answer
+	}
+	if typ == recHandshake && len(body) >= 4 && body[0] == hsServerHello {
+		return &no // the server went ahead at the lower version: the protection is absent
+	}
+	return nil
 }
 
 // bestAndFallback are the best protocol version the host offers that zcrypto can send, and the

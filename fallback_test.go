@@ -64,3 +64,18 @@ func TestHTTPCompressionDetected(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "gzip", h.Compression)
 }
+
+// A dropped connection or an unrelated alert says nothing about the SCSV: the result is nil, not a
+// finding.
+func TestScanFallbackSCSVInconclusive(t *testing.T) {
+	reset := scriptedServer(t, func(_ int, c net.Conn) { resetConn(c) })
+	require.Nil(t, scanFallbackSCSV(context.Background(), reset, twoLegacy, testOpts()))
+
+	otherAlert := scriptedServer(t, func(_ int, c net.Conn) {
+		if _, err := readClientHello(c); err != nil {
+			return
+		}
+		srvAlert(c, 40) // handshake_failure: refused for another reason
+	})
+	require.Nil(t, scanFallbackSCSV(context.Background(), otherAlert, twoLegacy, testOpts()))
+}
