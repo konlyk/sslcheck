@@ -106,6 +106,7 @@ func TestCertFindingLadders(t *testing.T) {
 		return ""
 	}
 	require.Equal(t, "CRITICAL", sev(Certificate{IntermediateExpiry: now.Add(-24 * time.Hour)}, "INTERMEDIATE_EXPIRY"))
+	require.Equal(t, "CRITICAL", sev(Certificate{IntermediateExpiry: now.Add(-time.Hour)}, "INTERMEDIATE_EXPIRY"), "expired an hour ago is expired")
 	require.Equal(t, "HIGH", sev(Certificate{IntermediateExpiry: now.Add(10 * 24 * time.Hour)}, "INTERMEDIATE_EXPIRY"))
 	require.Equal(t, "MEDIUM", sev(Certificate{IntermediateExpiry: now.Add(30 * 24 * time.Hour)}, "INTERMEDIATE_EXPIRY"))
 	require.Equal(t, "", sev(Certificate{IntermediateExpiry: now.Add(60 * 24 * time.Hour)}, "INTERMEDIATE_EXPIRY"))

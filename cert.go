@@ -342,8 +342,9 @@ func certFindings(c Certificate) []Vuln {
 	}
 	if !c.IntermediateExpiry.IsZero() {
 		// testssl's ladder: already expired CRITICAL, within 20 days HIGH, within 40 MEDIUM.
-		switch days := int(time.Until(c.IntermediateExpiry).Hours() / 24); {
-		case days < 0:
+		until := time.Until(c.IntermediateExpiry)
+		switch days := int(until.Hours() / 24); {
+		case until < 0:
 			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "CRITICAL", "", "CWE-324", "an intermediate certificate has expired"})
 		case days <= 20:
 			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "HIGH", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
