@@ -72,29 +72,38 @@ type Cipher struct {
 
 // Certificate is one certificate the host serves.
 type Certificate struct {
-	Leaf              *x509.Certificate   `json:"-"` // the parsed leaf, for callers; too large to serialise
-	Chain             []*x509.Certificate `json:"-"` // as served, leaf first; for callers, not serialised
-	CommonName        string
-	AltNames          []string
-	Issuer            string
-	Trusted           bool
-	NameMismatch      bool // the certificate is otherwise fine but not for this hostname
-	TrustReason       string
-	ChainComplete     bool   // the host sent the intermediates to a trusted root
-	ChainIncomplete   bool   // an issuer is neither served nor a trusted root (OpenSSL codes 20/21)
-	ChainError        string // why the chain fails, as testssl words OpenSSL's verify result
-	SelfSigned        bool
-	FingerprintSHA256 string
-	KeyType           string // "RSA 2048", "EC P-256"
-	KeyAlg            string // "RSA", "EC", "DSA", "EdDSA"
-	KeyBits           int    // RSA/DSA modulus or EC curve size; Ed25519 253
-	RSAExponent       int    // RSA public exponent; 0 for other keys
-	SignatureAlg      string
-	SignatureHash     string // "SHA1", "SHA256", "MD5", "MD2" …
-	Expires           time.Time
-	OCSPStapled       bool
-	Revoked           bool   // stapled OCSP, or (Options.CheckRevocation) the responder, says revoked
-	RevocationSource  string // "stapled OCSP" or the responder's URL
+	Leaf               *x509.Certificate   `json:"-"` // the parsed leaf, for callers; too large to serialise
+	Chain              []*x509.Certificate `json:"-"` // as served, leaf first; for callers, not serialised
+	CommonName         string
+	AltNames           []string
+	Issuer             string
+	Trusted            bool
+	NameMismatch       bool // the certificate is otherwise fine but not for this hostname
+	TrustReason        string
+	ChainComplete      bool   // the host sent the intermediates to a trusted root
+	ChainIncomplete    bool   // an issuer is neither served nor a trusted root (OpenSSL codes 20/21)
+	ChainError         string // why the chain fails, as testssl words OpenSSL's verify result
+	SelfSigned         bool
+	FingerprintSHA256  string
+	KeyType            string // "RSA 2048", "EC P-256"
+	KeyAlg             string // "RSA", "EC", "DSA", "EdDSA"
+	KeyBits            int    // RSA/DSA modulus or EC curve size; Ed25519 253
+	RSAExponent        int    // RSA public exponent; 0 for other keys
+	SignatureAlg       string
+	SignatureHash      string // "SHA1", "SHA256", "MD5", "MD2" …
+	Serial             string // the leaf's serial number, hex
+	FingerprintSHA1    string
+	NotBefore          time.Time
+	Expires            time.Time
+	ValidityDays       int // the leaf's validity span, notAfter - notBefore
+	OCSPStapled        bool
+	MustStaple         bool      // the leaf carries the TLS-feature must-staple extension
+	Transparency       bool      // a Certificate Transparency SCT is present (cert extension or staple)
+	ChainOrderProblem  bool      // the served chain is not in leaf-to-root order
+	WeakChainSig       string    // a non-leaf certificate is signed with SHA1/MD5/MD2 (that hash), else ""
+	IntermediateExpiry time.Time // the soonest-expiring intermediate's notAfter; zero when none served
+	Revoked            bool      // stapled OCSP, or (Options.CheckRevocation) the responder, says revoked
+	RevocationSource   string    // "stapled OCSP" or the responder's URL
 }
 
 // Expired reports whether the certificate's validity has passed.
@@ -186,6 +195,9 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		if sev := cipherOrderSeverity(orderLevel); sev != "" {
 			a.Vulns = append(a.Vulns, Vuln{"NO_CIPHER_ORDER", sev, "", "CWE-310", "the server lets the client choose the cipher, so a client may pick a weaker one than the server would"})
 		}
+	}
+	if len(a.Certificates) > 0 {
+		a.Vulns = append(a.Vulns, certFindings(a.Certificates[0])...)
 	}
 	rate(a)
 	return a, nil

@@ -7,9 +7,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha1" //nolint:gosec // fingerprint only
 	"crypto/sha256"
 	cryptotls "crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"io"
@@ -186,6 +188,14 @@ func describe(ctx context.Context, host string, chain []*x509.Certificate, stapl
 	}
 	c.KeyAlg, c.KeyBits, c.RSAExponent = keyInfo(leaf)
 	c.KeyType = keyType(leaf)
+	c.NotBefore = leaf.NotBefore
+	c.Serial = strings.ToUpper(leaf.SerialNumber.Text(16))
+	c.FingerprintSHA1 = sha1Fingerprint(leaf)
+	c.ValidityDays = int(leaf.NotAfter.Sub(leaf.NotBefore).Hours() / 24)
+	c.MustStaple = hasMustStaple(leaf)
+	c.Transparency = hasSCT(leaf) || ocspHasSCT(staple)
+	c.ChainOrderProblem = chainOutOfOrder(chain)
+	c.WeakChainSig, c.IntermediateExpiry = chainSignatureAndExpiry(chain)
 	// testssl: no issuer organisation, or the issuer's CN is the subject's.
 	c.SelfSigned = bytes.Equal(leaf.RawIssuer, leaf.RawSubject) ||
 		(leaf.Issuer.CommonName != "" && leaf.Issuer.CommonName == leaf.Subject.CommonName)
@@ -312,6 +322,126 @@ func fingerprint(c *x509.Certificate) string {
 		fmt.Fprintf(&b, "%02X", x)
 	}
 	return b.String()
+}
+
+// certFindings are the weaknesses that follow from a described certificate, as testssl reports
+// them (findings, not grade caps): an over-long validity, an intermediate about to expire, a
+// SHA1/MD5/MD2-signed intermediate, and a mis-ordered chain.
+func certFindings(c Certificate) []Vuln {
+	var out []Vuln
+	switch {
+	case c.ValidityDays >= 3650:
+		out = append(out, Vuln{"CERT_VALIDITY", "HIGH", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over ten years"})
+	case c.ValidityDays >= 1825:
+		out = append(out, Vuln{"CERT_VALIDITY", "MEDIUM", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over five years"})
+	case c.ValidityDays > 398 && c.NotBefore.Year() >= 2020 && !c.NotBefore.Before(sept2020):
+		out = append(out, Vuln{"CERT_VALIDITY", "MEDIUM", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over the 398-day maximum for certificates issued since September 2020"})
+	}
+	if !c.IntermediateExpiry.IsZero() {
+		switch days := int(time.Until(c.IntermediateExpiry).Hours() / 24); {
+		case days <= 20:
+			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "CRITICAL", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
+		case days <= 40:
+			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "HIGH", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
+		}
+	}
+	if c.WeakChainSig != "" {
+		out = append(out, Vuln{"WEAK_CHAIN_SIGNATURE", "MEDIUM", "", "CWE-327", "an intermediate certificate is signed with " + c.WeakChainSig})
+	}
+	if c.ChainOrderProblem {
+		out = append(out, Vuln{"CHAIN_ORDER", "LOW", "", "CWE-295", "the server sends the certificate chain out of order"})
+	}
+	return out
+}
+
+// sept2020 is the date after which the CA/Browser Forum caps leaf validity at 398 days.
+var sept2020 = time.Date(2020, 9, 1, 0, 0, 0, 0, time.UTC)
+
+func sha1Fingerprint(c *x509.Certificate) string {
+	sum := sha1.Sum(c.Raw) //nolint:gosec // a fingerprint, not a signature
+	var b strings.Builder
+	for _, x := range sum {
+		fmt.Fprintf(&b, "%02X", x)
+	}
+	return b.String()
+}
+
+// OIDs for the certificate features testssl reports.
+var (
+	oidMustStaple     = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}       // TLS feature
+	oidSCTList        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2} // CT precert SCTs
+	oidSCTOCSP        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 5} // CT SCTs in OCSP
+	oidFeatureID  int = 5                                                       // status_request, for must-staple
+)
+
+func hasExtension(c *x509.Certificate, oid asn1.ObjectIdentifier) []byte {
+	for _, e := range c.Extensions {
+		if e.Id.Equal(oid) {
+			return e.Value
+		}
+	}
+	return nil
+}
+
+// hasMustStaple reports whether the leaf carries the TLS-feature extension listing status_request,
+// which commits the server to stapling an OCSP response.
+func hasMustStaple(c *x509.Certificate) bool {
+	v := hasExtension(c, oidMustStaple)
+	if v == nil {
+		return false
+	}
+	var features []int
+	if _, err := asn1.Unmarshal(v, &features); err != nil {
+		return false
+	}
+	for _, f := range features {
+		if f == oidFeatureID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSCT(c *x509.Certificate) bool { return hasExtension(c, oidSCTList) != nil }
+
+// ocspHasSCT reports whether a stapled OCSP response carries a CT SCT extension, found by its OID
+// encoded in the DER (the x509 OCSP parser does not expose it).
+func ocspHasSCT(staple []byte) bool {
+	if len(staple) == 0 {
+		return false
+	}
+	der, err := asn1.Marshal(oidSCTOCSP)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(staple, der)
+}
+
+// chainOutOfOrder reports whether the served chain is not in leaf-to-root order: each certificate
+// after the first should be the issuer of the one before it.
+func chainOutOfOrder(chain []*x509.Certificate) bool {
+	for i := 1; i < len(chain); i++ {
+		if !bytes.Equal(chain[i].RawSubject, chain[i-1].RawIssuer) {
+			return true
+		}
+	}
+	return false
+}
+
+// chainSignatureAndExpiry reports the weakest signature hash among the non-leaf certificates (when
+// SHA1/MD5/MD2, else "") and the soonest intermediate expiry; a self-signed root in the chain is
+// not counted, as its own signature does not matter.
+func chainSignatureAndExpiry(chain []*x509.Certificate) (weak string, soonest time.Time) {
+	for _, c := range chain[1:] {
+		selfSigned := bytes.Equal(c.RawIssuer, c.RawSubject)
+		if h := signatureHash(c.SignatureAlgorithm); !selfSigned && (h == "SHA1" || h == "MD5" || h == "MD2") {
+			weak = h
+		}
+		if !selfSigned && (soonest.IsZero() || c.NotAfter.Before(soonest)) {
+			soonest = c.NotAfter
+		}
+	}
+	return weak, soonest
 }
 
 func keyType(c *x509.Certificate) string {
