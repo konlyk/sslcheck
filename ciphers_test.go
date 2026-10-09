@@ -3,6 +3,7 @@ package sslcheck
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -17,77 +18,103 @@ func resetConn(c net.Conn) {
 	_ = c.Close()
 }
 
-// enumerationServer scripts a cipher enumeration: on connection i it calls behave, which returns
-// the suite to accept, 0 to refuse with a handshake_failure alert, or -1 to reset the connection.
-func enumerationServer(t *testing.T, behave func(i int) int) string {
-	return scriptedServer(t, func(i int, c net.Conn) {
-		switch suite := behave(i); {
-		case suite < 0:
-			resetConn(c)
+// prefServer scripts a server with a cipher preference: on each hello it picks the first suite in
+// prefs the client offered, or refuses with handshake_failure. misbehave, when set, runs first on
+// the parsed hello and returns true if it handled (and ended) the connection itself; it is how a
+// test injects resets or closes for particular offers.
+func prefServer(t *testing.T, prefs []uint16, misbehave func(h helloInfo, c net.Conn) bool) string {
+	return scriptedServer(t, func(_ int, c net.Conn) {
+		h, err := readClientHello(c)
+		if err != nil {
 			return
-		case suite == 0:
-			if _, err := readClientHello(c); err != nil {
-				return
-			}
-			srvAlert(c, 40)
-		default:
-			if _, err := readClientHello(c); err != nil {
-				return
-			}
-			srvWrite(c, recHandshake, serverHelloMsg(uint16(suite), nil, compressionNone, false))
 		}
+		if misbehave != nil && misbehave(h, c) {
+			return
+		}
+		if pick := pickSuite(h, prefs...); pick != 0 {
+			srvWrite(c, recHandshake, serverHelloMsg(pick, nil, compressionNone, false))
+			return
+		}
+		srvAlert(c, 40)
 	})
 }
 
-// A burst of resets in the middle of an enumeration is retried through, and the list is complete:
-// the server accepts 0x002f, then drops the next three attempts (zcrypto's own retries), accepts
-// 0x0035 on the fourth, then refuses.
+var tls12 = Protocol{Name: "TLS1_2", Version: 0x0303}
+
+func ids(cs []Cipher) []uint16 {
+	var out []uint16
+	for _, c := range cs {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+// The chunked enumeration finds every accepted suite, with the server's first choice first.
+func TestCiphersAtEnumeratesAll(t *testing.T) {
+	prefs := []uint16{0xc030, 0xc02f, 0x0035, 0x002f, 0x000a}
+	addr := prefServer(t, prefs, nil)
+	cs, complete := ciphersAt(context.Background(), addr, tls12, testOpts())
+	require.True(t, complete)
+	require.ElementsMatch(t, prefs, ids(cs))
+	require.Equal(t, uint16(0xc030), cs[0].ID, "the server's first choice comes first")
+}
+
+// A burst of resets on offers of a particular suite is retried through, and the list is complete:
+// the server resets the first three hellos that offer 0x0035, then behaves.
 func TestCiphersAtRetriesDroppedConnections(t *testing.T) {
-	addr := enumerationServer(t, func(i int) int {
-		switch {
-		case i == 1:
-			return 0x002f
-		case i <= 4:
-			return -1
-		case i == 5:
-			return 0x0035
-		default:
-			return 0
+	prefs := []uint16{0xc030, 0x0035, 0x002f}
+	var mu sync.Mutex
+	resets := 0
+	addr := prefServer(t, prefs, func(h helloInfo, c net.Conn) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if pickSuite(h, 0x0035) != 0 && resets < 3 {
+			resets++
+			resetConn(c)
+			return true
 		}
+		return false
 	})
-	cs, complete := ciphersAt(context.Background(), addr, Protocol{Name: "TLS1_2", Version: 0x0303}, testOpts())
+	cs, complete := ciphersAt(context.Background(), addr, tls12, testOpts())
 	require.True(t, complete)
-	require.Equal(t, []string{"TLS_RSA_WITH_AES_128_CBC_SHA", "TLS_RSA_WITH_AES_256_CBC_SHA"}, []string{cs[0].Name, cs[1].Name})
+	require.ElementsMatch(t, prefs, ids(cs))
 }
 
-// A server that keeps resetting is given up on, and the list is reported incomplete rather than
-// passed off as the server's last word.
+// A server that keeps resetting one chain is given up on, and the list is reported incomplete
+// rather than passed off as the server's last word; the other chains still contribute.
 func TestCiphersAtReportsIncomplete(t *testing.T) {
-	addr := enumerationServer(t, func(i int) int {
-		if i == 1 {
-			return 0x002f
+	prefs := []uint16{0xc030, 0x0035, 0x002f}
+	addr := prefServer(t, prefs, func(h helloInfo, c net.Conn) bool {
+		if pickSuite(h, 0x0035) != 0 && pickSuite(h, 0xc030) == 0 { // every offer of 0x0035 past the first pick
+			resetConn(c)
+			return true
 		}
-		return -1
+		return false
 	})
-	cs, complete := ciphersAt(context.Background(), addr, Protocol{Name: "TLS1_2", Version: 0x0303}, testOpts())
+	cs, complete := ciphersAt(context.Background(), addr, tls12, testOpts())
 	require.False(t, complete)
-	require.Len(t, cs, 1)
+	require.Contains(t, ids(cs), uint16(0xc030))
+	require.Contains(t, ids(cs), uint16(0x002f))
+	require.NotContains(t, ids(cs), uint16(0x0035))
 }
 
-// A server that refuses by simply closing (no alert) has answered: the list is complete.
+// A server that refuses by simply closing (no alert), having read the hello, has answered: the
+// list is complete.
 func TestCiphersAtPlainCloseIsAnAnswer(t *testing.T) {
-	addr := scriptedServer(t, func(i int, c net.Conn) {
-		if _, err := readClientHello(c); err != nil {
+	addr := scriptedServer(t, func(_ int, c net.Conn) {
+		h, err := readClientHello(c)
+		if err != nil {
 			return
 		}
-		if i > 1 {
-			return // close without a word (having read the hello, so the close is a FIN, not a reset)
+		if pickSuite(h, 0x002f) != 0 {
+			srvWrite(c, recHandshake, serverHelloMsg(0x002f, nil, compressionNone, false))
+			return
 		}
-		srvWrite(c, recHandshake, serverHelloMsg(0x002f, nil, compressionNone, false))
+		// close without a word (having read the hello, so the close is a FIN, not a reset)
 	})
-	cs, complete := ciphersAt(context.Background(), addr, Protocol{Name: "TLS1_2", Version: 0x0303}, testOpts())
+	cs, complete := ciphersAt(context.Background(), addr, tls12, testOpts())
 	require.True(t, complete)
-	require.Len(t, cs, 1)
+	require.Equal(t, []uint16{0x002f}, ids(cs))
 }
 
 // A protocol probe that the network keeps dropping reports the failure rather than a plain "not

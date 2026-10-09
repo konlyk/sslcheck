@@ -164,23 +164,72 @@ func scanCiphers(ctx context.Context, addr string, protocols []Protocol, opts Op
 // (each retry waiting longer) before it gives the list up as incomplete.
 const enumerationRetries = 3
 
-// ciphersAt enumerates the ciphers one protocol accepts, the way testssl does: offer every suite,
-// note the one the server picks, drop it, and offer the rest, until the server accepts none. The
-// server says so with an alert, or, on some servers, by closing. Anything else (a timeout, a
-// reset, and a close too, since a host shedding load may close as well) is retried a few times
-// with backoff. After that, a persistent close is taken as the server's refusal, while a
-// persistent timeout or reset leaves the list incomplete.
+// enumerationChunks is how many drop-and-repeat chains run concurrently within one protocol.
+const enumerationChunks = 4
+
+// ciphersAt enumerates the ciphers one protocol accepts, the way testssl does: offer suites, note
+// the one the server picks, drop it, and offer the rest, until the server accepts none. One such
+// chain over every suite is as many round trips as there are accepted suites, each a fresh
+// connection to a distant host, so the work is split: the first offer of everything yields the
+// server's top choice, then the remaining suites are dealt into disjoint chunks whose chains run
+// concurrently, and the accepted suites are the union. A suite the server accepts is accepted
+// whichever other suites are offered beside it, so the set is the same as the serial chain's;
+// only the order past the first suite is no longer the server's full preference order.
+// complete is false when any chain ended on a network failure rather than the server's refusal.
 func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) (ciphers []Cipher, complete bool) {
 	if p.Version == versionTLS13 { // TLS 1.3: its suites are fixed and all strong
 		return tls13Ciphers(ctx, addr, opts), true
 	}
-	var out []Cipher
-	seen := map[uint16]bool{}
-	remaining := cipherIDs()
+	all := cipherIDs()
+	first, ok := enumerateChain(ctx, addr, p, all, opts, 1)
+	if len(first) == 0 {
+		return nil, ok // nothing accepted, or no answer
+	}
+	rest := remove(all, first[0])
+	chunks := make([][]uint16, enumerationChunks)
+	for i, id := range rest {
+		chunks[i%enumerationChunks] = append(chunks[i%enumerationChunks], id)
+	}
+	picks := make([][]uint16, len(chunks))
+	completes := make([]bool, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		if len(chunk) == 0 {
+			completes[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func(i int, chunk []uint16) {
+			defer wg.Done()
+			picks[i], completes[i] = enumerateChain(ctx, addr, p, chunk, opts, 0)
+		}(i, chunk)
+	}
+	wg.Wait()
+	ids := append([]uint16{first[0]}, concat(picks)...)
+	complete = ok
+	for _, c := range completes {
+		complete = complete && c
+	}
+	for _, id := range ids {
+		if info, found := cipherByID(id); found {
+			ciphers = append(ciphers, Cipher{ID: id, Name: info.name, Version: p.Name, Strength: info.strength, Bits: info.bits, Forward: info.forward})
+		}
+	}
+	return ciphers, complete
+}
+
+// enumerateChain runs one drop-and-repeat chain over remaining at protocol p and returns the
+// suites the server picked, in the order it picked them, stopping after maxPicks when that is not
+// zero. The server ends a chain with an alert, or, on some servers, by closing. Anything else (a
+// timeout, a reset, and a close too, since a host shedding load may close as well) is retried a
+// few times with backoff; after that, a persistent close is taken as the server's refusal, while
+// a persistent timeout or reset leaves the chain incomplete (complete false).
+func enumerateChain(ctx context.Context, addr string, p Protocol, remaining []uint16, opts Options, maxPicks int) (picks []uint16, complete bool) {
+	remaining = append([]uint16(nil), remaining...) // remove works in place; keep the caller's slice
 	retries := 0
-	for len(remaining) > 0 {
+	for len(remaining) > 0 && (maxPicks == 0 || len(picks) < maxPicks) {
 		if ctx.Err() != nil {
-			return out, false
+			return picks, false
 		}
 		log, err := legacyHandshake(ctx, addr, p.Version, remaining, opts)
 		// The ServerHello is the answer: a handshake that fails after it (a suite zcrypto cannot
@@ -194,21 +243,36 @@ func ciphersAt(ctx context.Context, addr string, p Protocol, opts Options) (ciph
 				continue
 			}
 			if isTransportFailure(err) {
-				return out, false
+				return picks, false
 			}
 			break // closed every time: the server's way of refusing
 		}
 		retries = 0
 		chosen := uint16(log.ServerHello.CipherSuite)
-		info, ok := cipherByID(chosen)
-		if !ok || seen[chosen] { // an unknown or already-seen pick means the server stopped cooperating
+		if !containsID(remaining, chosen) { // a pick we did not offer: the server stopped cooperating
 			break
 		}
-		seen[chosen] = true
-		out = append(out, Cipher{ID: chosen, Name: info.name, Version: p.Name, Strength: info.strength, Bits: info.bits, Forward: info.forward})
+		picks = append(picks, chosen)
 		remaining = remove(remaining, chosen)
 	}
-	return out, true
+	return picks, true
+}
+
+func containsID(ids []uint16, id uint16) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+func concat(lists [][]uint16) []uint16 {
+	var out []uint16
+	for _, l := range lists {
+		out = append(out, l...)
+	}
+	return out
 }
 
 func remove(ids []uint16, id uint16) []uint16 {

@@ -130,7 +130,9 @@ carries `Name`, `Severity` (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`), `CVE`, `CWE` and 
 
 - **Protocols**: SSLv2 (by a raw hello), SSLv3, TLS 1.0, 1.1, 1.2 and 1.3.
 - **Ciphers**: every suite the host accepts at each version, each classified strong / weak /
-  insecure, with its key size and whether its key exchange is forward-secret.
+  insecure, with its key size and whether its key exchange is forward-secret. Within a version the
+  server's first choice is listed first; the rest are found by concurrent drop-and-repeat chains
+  over disjoint chunks of the suite list and are not in the server's full preference order.
 - **Certificate**: one per certificate type the host serves (an RSA and an ECDSA certificate are
   described separately), each with its common name, SANs, issuer, key algorithm and size, signature
   algorithm and hash, SHA-256 and SHA-1 fingerprints, serial, validity window and length, chain
