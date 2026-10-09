@@ -41,6 +41,9 @@ type Assessment struct {
 	ALPN []string
 	// SessionTicket is whether the server issues an RFC 5077 session ticket.
 	SessionTicket bool
+	// FallbackSCSV is whether the server honours TLS_FALLBACK_SCSV (downgrade protection); nil
+	// when it offers no version to fall back from.
+	FallbackSCSV *bool
 	// DHBits and DHGroup describe the ephemeral DH group, when one is negotiated; DHGroup names a
 	// well-known prime (an RFC group or a software default) and is "" for a server-unique one.
 	DHBits  int
@@ -200,6 +203,11 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		defer wg.Done()
 		a.NegotiatedCurve, a.ALPN, a.SessionTicket = scanConnection(ctx, addr, a.Protocols, opts)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		a.FallbackSCSV = scanFallbackSCSV(ctx, addr, a.Protocols, opts)
+	}()
 	wg.Wait()
 	// No HTTP answer is a failure only when the network dropped the request; a host crypto/tls
 	// cannot talk to (a legacy-suite-only one), or one that is not HTTP at all, has answered.
@@ -213,6 +221,12 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	}
 	if len(a.Certificates) > 0 {
 		a.Vulns = append(a.Vulns, certFindings(a.Certificates[0])...)
+	}
+	if a.HTTP != nil && a.HTTP.Compression != "" {
+		a.Vulns = append(a.Vulns, Vuln{"BREACH", "MEDIUM", "CVE-2013-3587", "CWE-310", "the server compresses its HTTP response (" + a.HTTP.Compression + "), which can leak secrets in the body"})
+	}
+	if a.FallbackSCSV != nil && !*a.FallbackSCSV {
+		a.Vulns = append(a.Vulns, Vuln{"FALLBACK_SCSV", "LOW", "", "CWE-757", "the server does not honour TLS_FALLBACK_SCSV, so a downgrade attack is not resisted"})
 	}
 	rate(a)
 	return a, nil

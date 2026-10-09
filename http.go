@@ -19,6 +19,7 @@ type HTTPHeaders struct {
 	HSTS           string   // the first Strict-Transport-Security value; "" when absent
 	HPKP           []string // every Public-Key-Pins value
 	HPKPReportOnly []string // every Public-Key-Pins-Report-Only value
+	Compression    string   // the response Content-Encoding (gzip/deflate/br); "" when none (BREACH)
 }
 
 // fetchHTTPHeaders asks the host for / over TLS, at addr with SNI, without following redirects:
@@ -84,6 +85,10 @@ func fetchHTTPHeadersOnce(ctx context.Context, host, addr string, legacySuites [
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; sslcheck)")
+	// Ask for compression explicitly, which also stops the transport from stripping
+	// Content-Encoding as it transparently decompresses, so a compressing response is visible
+	// (the BREACH precondition).
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -93,6 +98,7 @@ func fetchHTTPHeadersOnce(ctx context.Context, host, addr string, legacySuites [
 		Status:         resp.StatusCode,
 		HPKP:           resp.Header.Values("Public-Key-Pins"),
 		HPKPReportOnly: resp.Header.Values("Public-Key-Pins-Report-Only"),
+		Compression:    strings.TrimSpace(resp.Header.Get("Content-Encoding")),
 	}
 	if v := resp.Header.Values("Strict-Transport-Security"); len(v) > 0 {
 		h.HSTS = v[0]
