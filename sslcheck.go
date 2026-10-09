@@ -31,6 +31,9 @@ type Assessment struct {
 	SecureRenegotiation *bool
 	// HTTP is what the server's HTTP answer says about TLS (HSTS, HPKP); nil when not fetched.
 	HTTP *HTTPHeaders
+	// CipherOrder is whether the server imposes its own cipher order rather than taking the
+	// client's; nil when there were not two accepted suites at any protocol to compare.
+	CipherOrder *bool
 
 	// The rating, as testssl computes it from SSL Labs's SSL Server Rating Guide.
 	Grade               string   // A+ … F, M (name mismatch) or T (not trusted)
@@ -167,11 +170,22 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 			a.HTTP, httpErr = fetchHTTPHeaders(ctx, host, addr, legacyCipherIDs(a.Ciphers), opts)
 		}()
 	}
+	var orderLevel int
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		a.CipherOrder, orderLevel, _ = scanCipherOrder(ctx, addr, a.Protocols, a.Ciphers, opts)
+	}()
 	wg.Wait()
 	// No HTTP answer is a failure only when the network dropped the request; a host crypto/tls
 	// cannot talk to (a legacy-suite-only one), or one that is not HTTP at all, has answered.
 	if httpErr != nil && isTransportFailure(httpErr) {
 		a.Incomplete = append(a.Incomplete, "http")
+	}
+	if a.CipherOrder != nil && !*a.CipherOrder {
+		if sev := cipherOrderSeverity(orderLevel); sev != "" {
+			a.Vulns = append(a.Vulns, Vuln{"NO_CIPHER_ORDER", sev, "", "CWE-310", "the server lets the client choose the cipher, so a client may pick a weaker one than the server would"})
+		}
 	}
 	rate(a)
 	return a, nil
