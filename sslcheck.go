@@ -34,6 +34,17 @@ type Assessment struct {
 	// CipherOrder is whether the server imposes its own cipher order rather than taking the
 	// client's; nil when there were not two accepted suites at any protocol to compare.
 	CipherOrder *bool
+	// NegotiatedCurve is the ECDHE curve the server chose (e.g. "x25519", "secp256r1"); "" when it
+	// negotiated no ECDHE suite.
+	NegotiatedCurve string
+	// ALPN is the application protocols the server selects (e.g. "h2", "http/1.1").
+	ALPN []string
+	// SessionTicket is whether the server issues an RFC 5077 session ticket.
+	SessionTicket bool
+	// DHBits and DHGroup describe the ephemeral DH group, when one is negotiated; DHGroup names a
+	// well-known prime (an RFC group or a software default) and is "" for a server-unique one.
+	DHBits  int
+	DHGroup string
 
 	// The rating, as testssl computes it from SSL Labs's SSL Server Rating Guide.
 	Grade               string   // A+ … F, M (name mismatch) or T (not trusted)
@@ -180,10 +191,14 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		}()
 	}
 	var orderLevel int
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		a.CipherOrder, orderLevel, _ = scanCipherOrder(ctx, addr, a.Protocols, a.Ciphers, opts)
+	}()
+	go func() {
+		defer wg.Done()
+		a.NegotiatedCurve, a.ALPN, a.SessionTicket = scanConnection(ctx, addr, a.Protocols, opts)
 	}()
 	wg.Wait()
 	// No HTTP answer is a failure only when the network dropped the request; a host crypto/tls
