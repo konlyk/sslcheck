@@ -31,22 +31,22 @@ Status: `[ ]` open, `[x]` fixed (commit noted).
 
 ## Should fix
 
-- [ ] **5. Intermediate expiry one notch too severe.** testssl: expired CRITICAL, within 20 days
+- [x] **5. Intermediate expiry one notch too severe.** testssl: expired CRITICAL, within 20 days
   HIGH, within 40 days MEDIUM. We use CRITICAL/HIGH for 20/40.
-- [ ] **6. Certificate findings cover only the first certificate.** A dual-certificate host's second
+- [x] **6. Certificate findings cover only the first certificate.** A dual-certificate host's second
   certificate is never checked for validity length or chain issues.
-- [ ] **7. Validity compared in whole days.** 398 days plus a few hours escapes the post-2020 rule
+- [x] **7. Validity compared in whole days.** 398 days plus a few hours escapes the post-2020 rule
   that testssl applies by the second. Compare the duration, not the truncated day count.
-- [ ] **8. `scanVulns` writes `DHBits`/`DHGroup` into the assessment it was handed** instead of
+- [x] **8. `scanVulns` writes `DHBits`/`DHGroup` into the assessment it was handed** instead of
   returning them; harmless (distinct fields) but against the pattern every other step follows.
 
 ## Limitations to surface or accept
 
-- [ ] **9. Protocols without a cipher order are computed but discarded.** Surface them so a
+- [x] **9. Protocols without a cipher order are computed but discarded.** Surface them so a
   `CipherOrder: false` is actionable.
-- [ ] **10. ALPN unread on legacy-suite-only hosts.** It is read through crypto/tls; read it from the
+- [x] **10. ALPN unread on legacy-suite-only hosts.** It is read through crypto/tls; read it from the
   zcrypto handshake as well so 3DES/RC4-only hosts report it.
-- [ ] 11. Curve and ticket are read from a legacy handshake, so TLS 1.3-only hosts show neither.
+- [x] 11. Curve and ticket are read from a legacy handshake, so TLS 1.3-only hosts show neither.
   Accepted for now (zcrypto has no TLS 1.3); noted in the field docs.
-- [ ] 12. BREACH fires on 27 of 30 hosts because nearly everyone gzips. Matches testssl's
+- [x] 12. BREACH fires on 27 of 30 hosts because nearly everyone gzips. Matches testssl's
   "potentially vulnerable" at MEDIUM. Decision: keep parity; revisit if it swamps reports.

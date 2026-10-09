@@ -22,25 +22,36 @@ func scanConnection(ctx context.Context, addr string, protocols []Protocol, opts
 		// cache); without it no server answers with one and tickets could never be seen.
 		log, _ := legacyHandshakeWith(ctx, addr, version, ecdheSuites, opts, func(c *ztls.Config) {
 			c.ForceSessionTicketExt = true
+			c.NextProtos = alpnProtocols // offer ALPN here too, for hosts crypto/tls cannot talk to
 		})
 		if log != nil {
 			if sh := log.ServerHello; sh != nil {
 				ticket = sh.TicketSupported
+				if sh.AlpnProtocol != "" {
+					alpn = append(alpn, sh.AlpnProtocol)
+				}
 			}
 			if ske := log.ServerKeyExchange; ske != nil && ske.ECDHParams != nil {
 				curve = strings.TrimSpace(ske.ECDHParams.TLSCurveID.Description())
 			}
 		}
 	}
-	alpn = scanALPN(ctx, addr, opts)
+	for _, p := range scanALPN(ctx, addr, opts) {
+		if !contains(alpn, p) {
+			alpn = append(alpn, p)
+		}
+	}
 	return curve, alpn, ticket
 }
+
+// alpnProtocols are the application protocols the scan asks about.
+var alpnProtocols = []string{"h2", "http/1.1"}
 
 // scanALPN asks, over whatever TLS version crypto/tls negotiates, which of the common application
 // protocols the server selects; testssl lists these as the host's ALPN/HTTP2 support.
 func scanALPN(ctx context.Context, addr string, opts Options) []string {
 	var out []string
-	for _, proto := range []string{"h2", "http/1.1"} {
+	for _, proto := range alpnProtocols {
 		if ctx.Err() != nil {
 			break
 		}

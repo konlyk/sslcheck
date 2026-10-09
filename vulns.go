@@ -19,9 +19,9 @@ type Vuln struct {
 }
 
 // scanVulns collects the host's weaknesses: those that follow from the protocols and ciphers it
-// offers, and those found by an active probe.
-func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []Vuln {
-	var out []Vuln
+// offers, and those found by an active probe. It also returns the DH group it read for the
+// Logjam check, so the caller can record it.
+func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) (out []Vuln, dhBits int, dhGroup string) {
 	add := func(v Vuln) { out = append(out, v) }
 
 	offered := map[string]bool{}
@@ -65,7 +65,7 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 	if hasExportDH {
 		add(Vuln{"LOGJAM", "MEDIUM", "CVE-2015-4000", "CWE-310", "an export-grade DH cipher is accepted"})
 	} else if bits, group := dhParams(ctx, addr, bestLegacyVersion(a.Protocols), opts); bits > 0 {
-		a.DHBits, a.DHGroup = bits, group
+		dhBits, dhGroup = bits, group
 		// testssl grades a well-known prime (one an attacker may have precomputed for) harsher
 		// than an unknown one of the same size, and an unknown one only at 1024 bits or less.
 		if group != "" {
@@ -120,7 +120,7 @@ func scanVulns(ctx context.Context, addr string, a *Assessment, opts Options) []
 			add(Vuln{"ROBOT", "HIGH", "CVE-2017-17382 CVE-2017-17427 CVE-2017-13099", "CWE-203", rb})
 		}
 	}
-	return out
+	return out, dhBits, dhGroup
 }
 
 // heartbleed reports whether the host bleeds memory in answer to a malformed heartbeat. zcrypto
