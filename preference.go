@@ -41,6 +41,11 @@ func scanCipherOrder(ctx context.Context, addr string, protocols []Protocol, cip
 			yes := true
 			order = &yes
 		}
+		if first != second && isChaCha(second) && orderedWithoutChaCha(ctx, addr, p, ids, opts) {
+			// The server keeps its order but lets a client that prefers ChaCha20 have it (an
+			// equal-preference group, as BoringSSL servers do); testssl counts that as an order.
+			continue
+		}
 		if first != second {
 			*order = false
 			noOrder = append(noOrder, p.Name)
@@ -50,6 +55,32 @@ func scanCipherOrder(ctx context.Context, addr string, protocols []Protocol, cip
 		}
 	}
 	return order, level, noOrder
+}
+
+// orderedWithoutChaCha repeats the two-order comparison with the ChaCha20 suites left out, which
+// tells a server that merely honours a client's ChaCha preference from one with no order at all.
+func orderedWithoutChaCha(ctx context.Context, addr string, p Protocol, ids []uint16, opts Options) bool {
+	var rest []uint16
+	for _, id := range ids {
+		if !isChaCha(id) {
+			rest = append(rest, id)
+		}
+	}
+	if len(rest) < 2 {
+		return true // ChaCha and one other suite: nothing else to be out of order
+	}
+	first, ok1 := pickAt(ctx, addr, p, rest, opts)
+	second, ok2 := pickAt(ctx, addr, p, reversed(rest), opts)
+	return ok1 && ok2 && first == second
+}
+
+// isChaCha reports whether a suite id is a ChaCha20-Poly1305 suite (TLS 1.3's included).
+func isChaCha(id uint16) bool {
+	if id == 0x1303 {
+		return true
+	}
+	info, ok := cipherByID(id)
+	return ok && has(strings.ToUpper(info.name), "CHACHA20")
 }
 
 // pickAt is the suite the server picks when offered ids, in that order, at protocol p.
