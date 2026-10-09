@@ -4,6 +4,8 @@ import (
 	"context"
 	cryptotls "crypto/tls"
 	"strings"
+
+	ztls "github.com/zmap/zcrypto/tls"
 )
 
 // ecdheSuites are the ECDHE suites offered to read the server's negotiated curve.
@@ -16,7 +18,12 @@ var ecdheSuites = []uint16{0xc02f, 0xc030, 0xc02b, 0xc02c, 0xc013, 0xc014, 0xc00
 func scanConnection(ctx context.Context, addr string, protocols []Protocol, opts Options) (curve string, alpn []string, ticket bool) {
 	version := bestLegacyVersion(protocols)
 	if version != 0 {
-		if log, _ := legacyHandshake(ctx, addr, version, ecdheSuites, opts); log != nil {
+		// zcrypto offers the session-ticket extension only when told to (or when it has a session
+		// cache); without it no server answers with one and tickets could never be seen.
+		log, _ := legacyHandshakeWith(ctx, addr, version, ecdheSuites, opts, func(c *ztls.Config) {
+			c.ForceSessionTicketExt = true
+		})
+		if log != nil {
 			if sh := log.ServerHello; sh != nil {
 				ticket = sh.TicketSupported
 			}

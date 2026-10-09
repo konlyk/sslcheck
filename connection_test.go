@@ -47,3 +47,20 @@ func upperHex(s string) string {
 	}
 	return string(b)
 }
+
+// A server that issues session tickets is seen to: the probe must offer the session-ticket
+// extension for the server to answer with one (the in-process crypto/tls server issues tickets by
+// default).
+func TestScanConnectionSeesSessionTicket(t *testing.T) {
+	addr, _ := localServer(t, modernConfig())
+	protos := []Protocol{{Name: "TLS1_2", Version: 0x0303, Offered: true}}
+	curve, _, ticket := scanConnection(context.Background(), addr, protos, Options{Timeout: 3 * time.Second, ServerName: "localhost"})
+	require.True(t, ticket, "the server issues tickets when offered the extension")
+	require.NotEmpty(t, curve, "an ECDHE suite was negotiated")
+
+	noTickets := modernConfig()
+	noTickets.SessionTicketsDisabled = true
+	addr2, _ := localServer(t, noTickets)
+	_, _, ticket = scanConnection(context.Background(), addr2, protos, Options{Timeout: 3 * time.Second, ServerName: "localhost"})
+	require.False(t, ticket)
+}
