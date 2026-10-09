@@ -33,7 +33,9 @@ type Assessment struct {
 	HTTP *HTTPHeaders
 	// CipherOrder is whether the server imposes its own cipher order rather than taking the
 	// client's; nil when there were not two accepted suites at any protocol to compare.
-	CipherOrder *bool
+	// ClientCipherOrder names the protocols at which the client decides.
+	CipherOrder       *bool
+	ClientCipherOrder []string
 	// NegotiatedCurve is the ECDHE curve the server chose (e.g. "x25519", "secp256r1"); "" when it
 	// negotiated no ECDHE suite.
 	NegotiatedCurve string
@@ -184,7 +186,7 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 		defer wg.Done()
 		a.Compression, a.SecureRenegotiation = scanSessionFeatures(ctx, addr, a.Protocols, opts)
 	}()
-	go func() { defer wg.Done(); a.Vulns = scanVulns(ctx, addr, a, opts) }()
+	go func() { defer wg.Done(); a.Vulns, a.DHBits, a.DHGroup = scanVulns(ctx, addr, a, opts) }()
 	var httpErr error
 	if !opts.SkipHTTP {
 		wg.Add(1)
@@ -197,7 +199,7 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		a.CipherOrder, orderLevel, _ = scanCipherOrder(ctx, addr, a.Protocols, a.Ciphers, opts)
+		a.CipherOrder, orderLevel, a.ClientCipherOrder = scanCipherOrder(ctx, addr, a.Protocols, a.Ciphers, opts)
 	}()
 	go func() {
 		defer wg.Done()
@@ -219,9 +221,7 @@ func Scan(ctx context.Context, host, addr string, opts Options) (*Assessment, er
 			a.Vulns = append(a.Vulns, Vuln{"NO_CIPHER_ORDER", sev, "", "CWE-310", "the server lets the client choose the cipher, so a client may pick a weaker one than the server would"})
 		}
 	}
-	if len(a.Certificates) > 0 {
-		a.Vulns = append(a.Vulns, certFindings(a.Certificates[0])...)
-	}
+	a.Vulns = append(a.Vulns, allCertFindings(a.Certificates)...)
 	if a.HTTP != nil && a.HTTP.Compression != "" {
 		a.Vulns = append(a.Vulns, Vuln{"BREACH", "MEDIUM", "CVE-2013-3587", "CWE-310", "the server compresses its HTTP response (" + a.HTTP.Compression + "), which can leak secrets in the body"})
 	}

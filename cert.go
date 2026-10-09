@@ -329,20 +329,26 @@ func fingerprint(c *x509.Certificate) string {
 // SHA1/MD5/MD2-signed intermediate, and a mis-ordered chain.
 func certFindings(c Certificate) []Vuln {
 	var out []Vuln
+	// testssl compares the validity span by the second, not by whole days.
+	const day = 24 * time.Hour
+	validity := c.Expires.Sub(c.NotBefore)
 	switch {
-	case c.ValidityDays >= 3650:
+	case validity >= 10*365*day:
 		out = append(out, Vuln{"CERT_VALIDITY", "HIGH", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over ten years"})
-	case c.ValidityDays >= 1825:
+	case validity >= 5*365*day:
 		out = append(out, Vuln{"CERT_VALIDITY", "MEDIUM", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over five years"})
-	case c.ValidityDays > 398 && c.NotBefore.Year() >= 2020 && !c.NotBefore.Before(sept2020):
+	case validity > 398*day && !c.NotBefore.Before(sept2020):
 		out = append(out, Vuln{"CERT_VALIDITY", "MEDIUM", "", "CWE-295", "the certificate is valid for " + itoa(c.ValidityDays) + " days, over the 398-day maximum for certificates issued since September 2020"})
 	}
 	if !c.IntermediateExpiry.IsZero() {
+		// testssl's ladder: already expired CRITICAL, within 20 days HIGH, within 40 MEDIUM.
 		switch days := int(time.Until(c.IntermediateExpiry).Hours() / 24); {
+		case days < 0:
+			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "CRITICAL", "", "CWE-324", "an intermediate certificate has expired"})
 		case days <= 20:
-			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "CRITICAL", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
-		case days <= 40:
 			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "HIGH", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
+		case days <= 40:
+			out = append(out, Vuln{"INTERMEDIATE_EXPIRY", "MEDIUM", "", "CWE-324", "an intermediate certificate expires in " + itoa(days) + " days"})
 		}
 	}
 	if c.WeakChainSig != "" {
@@ -356,6 +362,23 @@ func certFindings(c Certificate) []Vuln {
 
 // sept2020 is the date after which the CA/Browser Forum caps leaf validity at 398 days.
 var sept2020 = time.Date(2020, 9, 1, 0, 0, 0, 0, time.UTC)
+
+// allCertFindings is certFindings over every certificate the host serves, each finding reported
+// once however many certificates share it.
+func allCertFindings(certs []Certificate) []Vuln {
+	var out []Vuln
+	seen := map[string]bool{}
+	for _, c := range certs {
+		for _, v := range certFindings(c) {
+			key := v.Name + "|" + v.Remark
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
 
 func sha1Fingerprint(c *x509.Certificate) string {
 	sum := sha1.Sum(c.Raw) //nolint:gosec // a fingerprint, not a signature
